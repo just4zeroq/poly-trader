@@ -38,6 +38,7 @@ from polymarket.models.clob.market_events import (
 from .client import SdkClient
 from .executors import OrderExecutor, PaperExecutor
 from .models import (
+    Decision,
     MarketInfo,
     MarketSpec,
     OrderBookSnapshot,
@@ -154,9 +155,9 @@ class LogSubscriber:
                        ev.outcome, ev.amount, ev.price, ev.reason)
 
     async def _on_tick(self, ev: TickEvent):
-        logger.info("  [%s][%4ds] Up=%.4f  Down=%.4f  sum=%.4f  → buy Up=%d Down=%d",
+        logger.info("  [%s][%4ds] Up=%.4f  Down=%.4f  sum=%.4f  → Up=%d Down=%d [%s]",
                     ev.slug, ev.elapsed, ev.up_price, ev.down_price, ev.price_sum,
-                    ev.up_buy, ev.down_buy)
+                    ev.up_buy, ev.down_buy, ev.roles)
 
     async def _on_win_start(self, ev: WindowStart):
         logger.info("")
@@ -707,11 +708,16 @@ class TradingEngine:
 
             up_snap = self.prices.get(market.up_token_id)
             down_snap = self.prices.get(market.down_token_id)
-            up_buy, down_buy = self.strategy.decide(
+            decisions = self.strategy.decide(
                 ws_state, up_price, down_price,
                 remaining_time=remaining,
                 up_snap=up_snap, down_snap=down_snap,
             )
+
+            # Summarise decisions for tick event
+            up_buy = sum(d.amount for d in decisions if d.side == "Up")
+            down_buy = sum(d.amount for d in decisions if d.side == "Down")
+            roles = "/".join(d.role for d in decisions) if decisions else "idle"
 
             await self._emit("tick", TickEvent(
                 window_num=win_num,
@@ -722,12 +728,15 @@ class TradingEngine:
                 price_sum=round(up_price + down_price, 4),
                 up_buy=up_buy,
                 down_buy=down_buy,
+                roles=roles,
             ))
 
-            if up_buy > 0:
-                await self._place_order(market.slug, market.up_token_id, "Up", up_price, up_buy)
-            if down_buy > 0:
-                await self._place_order(market.slug, market.down_token_id, "Down", down_price, down_buy)
+            for d in decisions:
+                token_id = market.up_token_id if d.side == "Up" else market.down_token_id
+                await self._place_order(
+                    market.slug, token_id, d.side, d.price, d.amount,
+                    pairing_lot_id=d.lot_id,
+                )
 
             # Paper mode: periodic fill fallback (trade events may not arrive)
             if self.paper and ws_state.pending_orders:
@@ -841,8 +850,12 @@ class TradingEngine:
     # ── Order execution ──
 
     async def _place_order(self, slug: str, token_id: str, outcome: str,
-                           price: float, amount: int):
-        await self.executor.place(slug, token_id, outcome, price, amount)
+                           price: float, amount: int,
+                           pairing_lot_id: str | None = None):
+        await self.executor.place(
+            slug, token_id, outcome, price, amount,
+            pairing_lot_id=pairing_lot_id,
+        )
 
     # ── Settlement ──
 

@@ -108,6 +108,35 @@ class OrderBookSnapshot:
 
 
 @dataclass
+class Lot:
+    """A single fill record — the fundamental unit of cost tracking and pairing."""
+    lot_id: str
+    side: str         # "Up" / "Down"
+    amount: int       # original fill size
+    price: float      # fill price
+    paired_qty: int = 0
+    created_at: float = 0.0
+
+    @property
+    def unpaired_qty(self) -> int:
+        return self.amount - self.paired_qty
+
+    @property
+    def is_fully_paired(self) -> bool:
+        return self.paired_qty >= self.amount
+
+
+@dataclass
+class Decision:
+    """Output of strategy.decide() — one order instruction per tick per role."""
+    side: str            # "Up" / "Down"
+    amount: int          # order size
+    price: float         # maker limit price (role-specific aggressiveness applied)
+    role: str            # "cheap" / "pairing"
+    lot_id: str | None = None  # pairing role: the lot being paired; cheap role: None
+
+
+@dataclass
 class PendingOrder:
     """An order placed but not yet fully filled."""
     order_id: str
@@ -119,6 +148,7 @@ class PendingOrder:
     filled: int = 0
     placed_at: float = 0.0
     cancelled_at: float = 0.0  # soft-delete timestamp; > 0 means cancel requested
+    pairing_lot_id: str | None = None  # pairing role: lot being paired; cheap: None
 
     @property
     def remaining(self) -> int:
@@ -151,6 +181,7 @@ class WindowState:
     total_spent: float = 0.0
     trades: int = 0
     pending_orders: dict[str, PendingOrder] = field(default_factory=dict)
+    lots: list = field(default_factory=list)  # list[Lot] — per-fill records for pairing
 
     @property
     def avg_cost_up(self) -> float:
@@ -269,6 +300,7 @@ class TickEvent:
     price_sum: float
     up_buy: int
     down_buy: int
+    roles: str = ""         # e.g. "pairing/cheap" or "cheap" or "idle"
 
 
 @dataclass

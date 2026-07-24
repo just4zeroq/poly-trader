@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Optional
 from polymarket.models.clob.user_events import UserTradeEvent
 
 from .models import (
+    Lot,
     OrderCancelled,
     OrderFilled,
     OrderFailed,
@@ -37,7 +38,8 @@ class OrderExecutor:
         self.engine: TradingEngine | None = None
 
     async def place(self, slug: str, token_id: str, outcome: str,
-                    price: float, amount: int) -> Optional[str]:
+                    price: float, amount: int,
+                    pairing_lot_id: str | None = None) -> Optional[str]:
         raise NotImplementedError
 
     async def cancel(self, order_id: str) -> bool:
@@ -64,12 +66,31 @@ class OrderExecutor:
         """Remove soft-deleted orders past grace period. No-op in base."""
         pass
 
+    def _create_lot_and_pair(self, ws: WindowState, po: PendingOrder,
+                              fill_size: int, fill_price: float):
+        """Create a Lot for this fill and update paired lot if pairing."""
+        lot_id = f"lot_{ws.window_num}_{po.side}_{len(ws.lots)}"
+        lot = Lot(
+            lot_id=lot_id, side=po.side,
+            amount=fill_size, price=fill_price,
+            paired_qty=0, created_at=time.time(),
+        )
+        ws.lots.append(lot)
+
+        # If this was a pairing order, mark the paired lot
+        if po.pairing_lot_id:
+            for existing in ws.lots:
+                if existing.lot_id == po.pairing_lot_id:
+                    existing.paired_qty += fill_size
+                    break
+
 
 class PaperExecutor(OrderExecutor):
     """Paper trading — orders sit pending until matched by real WS trades."""
 
     async def place(self, slug: str, token_id: str, outcome: str,
-                    price: float, amount: int) -> Optional[str]:
+                    price: float, amount: int,
+                    pairing_lot_id: str | None = None) -> Optional[str]:
         ws = self.engine._windows.get(slug)
         if ws is None:
             return None
@@ -85,6 +106,7 @@ class PaperExecutor(OrderExecutor):
             side=outcome, buy_sell="BUY",
             price=price, amount=amount,
             placed_at=time.time(),
+            pairing_lot_id=pairing_lot_id,
         )
         await self.engine._emit("order_placed", OrderPlaced(
             window_num=ws.window_num,
@@ -134,6 +156,10 @@ class PaperExecutor(OrderExecutor):
                 ws.cost[po.side] += po.amount * po.price
                 ws.total_spent += po.amount * po.price
                 ws.trades += 1
+
+                # Create lot and handle pairing
+                self._create_lot_and_pair(ws, po, po.amount, po.price)
+
                 del ws.pending_orders[oid]
                 await self.engine._emit("order_filled", OrderFilled(
                     window_num=ws.window_num,
@@ -168,6 +194,10 @@ class PaperExecutor(OrderExecutor):
             ws.cost[po.side] += po.amount * po.price
             ws.total_spent += po.amount * po.price
             ws.trades += 1
+
+            # Create lot and handle pairing
+            self._create_lot_and_pair(ws, po, po.amount, po.price)
+
             del ws.pending_orders[oid]
             await self.engine._emit("order_filled", OrderFilled(
                 window_num=ws.window_num,
@@ -182,7 +212,8 @@ class LiveExecutor(OrderExecutor):
     """Live trading — SDK place_limit_order + cancel_order."""
 
     async def place(self, slug: str, token_id: str, outcome: str,
-                    price: float, amount: int) -> Optional[str]:
+                    price: float, amount: int,
+                    pairing_lot_id: str | None = None) -> Optional[str]:
         ws = self.engine._windows.get(slug)
         if ws is None:
             return None
@@ -196,6 +227,7 @@ class LiveExecutor(OrderExecutor):
                 side=outcome, buy_sell="BUY",
                 price=price, amount=amount,
                 placed_at=time.time(),
+                pairing_lot_id=pairing_lot_id,
             )
             await self.engine._emit("order_placed", OrderPlaced(
                 window_num=ws.window_num,
@@ -283,6 +315,10 @@ class LiveExecutor(OrderExecutor):
                 ws.cost[po.side] += fill_size * fill_price
                 ws.total_spent += fill_size * fill_price
                 ws.trades += 1
+
+                # Create lot and handle pairing
+                self._create_lot_and_pair(ws, po, fill_size, fill_price)
+
                 await self.engine._emit("order_filled", OrderFilled(
                     window_num=ws.window_num,
                     outcome=po.side, price=fill_price, amount=fill_size,

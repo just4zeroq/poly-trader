@@ -78,6 +78,8 @@ class Config:
     per_tick: int = field(default_factory=lambda: _env_int("per_tick", 5))
     max_per_side: int = field(default_factory=lambda: _env_int("max_per_side", 500))
     aggressiveness: float = field(default_factory=lambda: _env_float("aggressiveness", 0.3))
+    pairing_aggressiveness: float = field(default_factory=lambda: _env_float("pairing_aggressiveness", 0.5))
+    """Aggressiveness for the pairing role — higher to increase fill probability."""
     maker_fee: float = field(default_factory=lambda: _env_float("maker_fee", 0.0))
     cancel_replace_threshold: float = field(default_factory=lambda: _env_float("cancel_replace_threshold", 0.10))
     max_pair_sum: float = field(default_factory=lambda: _env_float("max_pair_sum", 1.0))
