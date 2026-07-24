@@ -157,12 +157,13 @@ class TemporalArbStrategy:
                             snap.best_bid + snap.spread * self.cfg.aggressiveness, 4,
                         )
                         # Guard 4: don't buy if the resulting lot would be
-                        # unpairable — i.e. the opposite side's best possible
-                        # price exceeds the max_pair_cost cap.
+                        # unpairable.  Use the pairer's actual aggressiveness
+                        # to estimate the opposite-side price — not the
+                        # best-case bid.
                         opp_snap = down_snap if cheap == "Up" else up_snap
-                        if opp_snap and opp_snap.best_bid:
-                            if price + opp_snap.best_bid > self.cfg.max_pair_cost:
-                                # lot would be stranded — skip
+                        if opp_snap and opp_snap.best_bid and opp_snap.best_ask:
+                            opp_pairing_price = opp_snap.best_bid + opp_snap.spread * self.cfg.pairing_aggressiveness
+                            if price + opp_pairing_price > self.cfg.max_pair_cost:
                                 return decisions
 
                         qty = min(per_tick, max_side - (inv_up if cheap == "Up" else inv_down))
