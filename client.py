@@ -109,6 +109,47 @@ class SdkClient:
             close_time=str(market.state.end_date) if market.state and market.state.end_date else None,
         )
 
+    async def get_resolved_winner(self, slug: str) -> Optional[str]:
+        """Query Gamma API for a market's resolved outcome.
+
+        Returns "Up", "Down", or None if not yet resolved.
+        Used at settlement time to get the actual winner instead of guessing from WS midpoints.
+        """
+        try:
+            market = await self.public.get_market(slug=slug)
+        except Exception:
+            logger.debug("get_resolved_winner(%s): API query failed", slug)
+            return None
+
+        if not market or not market.outcomes:
+            return None
+
+        yes_outcome = market.outcomes.yes
+        no_outcome = market.outcomes.no
+        if not yes_outcome or not no_outcome:
+            return None
+
+        yes_price = yes_outcome.price
+        no_price = no_outcome.price
+
+        # Resolved: winning side at $1, loser at $0
+        if yes_price is not None and float(yes_price) >= 0.99:
+            return "Up"
+        if no_price is not None and float(no_price) >= 0.99:
+            return "Down"
+
+        # Market closed but prices not yet at extremes — use which is higher
+        if market.state and market.state.closed:
+            if yes_price is not None and no_price is not None:
+                yp = float(yes_price)
+                np = float(no_price)
+                if yp > np:
+                    return "Up"
+                elif np > yp:
+                    return "Down"
+
+        return None
+
     async def find_market_for_spec(self, spec: MarketSpec) -> Optional[MarketInfo]:
         """Find the current market window for a given spec.
 

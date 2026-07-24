@@ -844,26 +844,34 @@ class TradingEngine:
         await self.executor.cancel_all(ws.pending_orders)
         ws.pending_orders.clear()
 
-        # Determine winner from cached WS midpoints (no REST calls)
-        up_snap = self.prices.get(market.up_token_id)
-        down_snap = self.prices.get(market.down_token_id)
-        up_mid = up_snap.mid_price if up_snap else None
-        down_mid = down_snap.mid_price if down_snap else None
-        # Winner detection with two confidence tiers:
-        #   High:     > 0.75 / < 0.25  →  confident call
-        #   Medium:   > 0.65 & opponent < 0.35  →  clear leader
-        #   Unknown:  everything else → skip PnL
+        # Determine winner — prefer Gamma API (actual resolution), fall back to WS midpoints
         winner = None
-        if up_mid and down_mid:
-            if up_mid > 0.75:
-                winner = "Up"
-            elif up_mid < 0.25:
-                winner = "Down"
-            elif up_mid > 0.65 and down_mid < 0.35:
-                winner = "Up"
-            elif down_mid > 0.65 and up_mid < 0.35:
-                winner = "Down"
-            # else: uncertain → leave winner=None so pnl stays None
+
+        # Tier 1: Query Gamma API for resolved outcome
+        for attempt in range(3):
+            winner = await self.sdk.get_resolved_winner(market.slug)
+            if winner is not None:
+                logger.info("  [%s] API resolved winner: %s (attempt %d)", market.slug, winner, attempt + 1)
+                break
+            if attempt < 2:
+                await asyncio.sleep(2)  # wait for oracle to settle
+
+        # Tier 2: Fall back to WS midpoint heuristic if API didn't resolve
+        if winner is None:
+            logger.warning("  [%s] API not resolved, falling back to WS midpoint guess", market.slug)
+            up_snap = self.prices.get(market.up_token_id)
+            down_snap = self.prices.get(market.down_token_id)
+            up_mid = up_snap.mid_price if up_snap else None
+            down_mid = down_snap.mid_price if down_snap else None
+            if up_mid and down_mid:
+                if up_mid > 0.75:
+                    winner = "Up"
+                elif up_mid < 0.25:
+                    winner = "Down"
+                elif up_mid > 0.65 and down_mid < 0.35:
+                    winner = "Up"
+                elif down_mid > 0.65 and up_mid < 0.35:
+                    winner = "Down"
 
         rpt = ws.report(winner=winner)
         pnl = rpt.get("pnl")  # None if no winner
