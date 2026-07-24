@@ -96,6 +96,8 @@ class Config:
     """Hard cap on |N_up − N_down| — unpaired exposure limit."""
     max_price_dev: float = field(default_factory=lambda: _env_float("max_price_dev", 0.20))
     max_spread: float = field(default_factory=lambda: _env_float("max_spread", 0.05))
+    max_extreme_price: float = field(default_factory=lambda: _env_float("max_extreme_price", 0.90))
+    """Skip tick if either side's best_bid exceeds this (market is already settled)."""
     max_pair_cost: float = field(default_factory=lambda: _env_float("max_pair_cost", 0.9999))
     min_pair_cost_fills: int = field(default_factory=lambda: _env_int("min_pair_cost_fills", 2))
     kill_pnl_per_pair: float = field(default_factory=lambda: _env_float("kill_pnl_per_pair", 0.03))

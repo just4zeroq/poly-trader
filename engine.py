@@ -737,6 +737,16 @@ class TradingEngine:
             logger.info("[%s] Down spread %.4f too wide → skip", slug, down_snap.spread)
             return None, None
 
+        # Skip if either side is already settled (best_bid > threshold)
+        if up_snap.best_bid > self.cfg.max_extreme_price:
+            logger.info("[%s] Up best_bid %.4f > %.2f → market settled, skip",
+                        slug, up_snap.best_bid, self.cfg.max_extreme_price)
+            return None, None
+        if down_snap.best_bid > self.cfg.max_extreme_price:
+            logger.info("[%s] Down best_bid %.4f > %.2f → market settled, skip",
+                        slug, down_snap.best_bid, self.cfg.max_extreme_price)
+            return None, None
+
         # Compute maker prices from order books
         up_price = self._maker_price(up_snap)
         down_price = self._maker_price(down_snap)
