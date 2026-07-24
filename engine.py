@@ -540,8 +540,9 @@ class TradingEngine:
             elapsed = now - ws_ts
             remaining = duration - elapsed
 
-            # Minimum time to bother: at least 10s or 10% of window
-            min_remain = max(10, duration // 10)
+            # Minimum remaining: at least min_remaining_time + 60s so the
+            # cheap-seeker has enough runway to accumulate before the cut-off.
+            min_remain = max(90, self.cfg.min_remaining_time + 60)
 
             if remaining >= min_remain:
                 # Window has enough time left — join it
@@ -668,17 +669,19 @@ class TradingEngine:
             down_buy = sum(d.amount for d in decisions if d.side == "Down")
             roles = "/".join(d.role for d in decisions) if decisions else "idle"
 
-            await self._emit("tick", TickEvent(
-                window_num=win_num,
-                slug=market.slug,
-                elapsed=int(now - ws_state.start_time),
-                up_price=up_price,
-                down_price=down_price,
-                price_sum=round(up_price + down_price, 4),
-                up_buy=up_buy,
-                down_buy=down_buy,
-                roles=roles,
-            ))
+            # Only emit tick events for active ticks (reduce idle log spam)
+            if decisions:
+                await self._emit("tick", TickEvent(
+                    window_num=win_num,
+                    slug=market.slug,
+                    elapsed=int(now - ws_state.start_time),
+                    up_price=up_price,
+                    down_price=down_price,
+                    price_sum=round(up_price + down_price, 4),
+                    up_buy=up_buy,
+                    down_buy=down_buy,
+                    roles=roles,
+                ))
 
             for d in decisions:
                 token_id = market.up_token_id if d.side == "Up" else market.down_token_id

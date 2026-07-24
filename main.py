@@ -152,7 +152,7 @@ def main():
         print(f"  {spec} [{spec.slug_pattern}]")
     if args.mode == "run":
         print(f"  per_tick={args.per_tick or Config().per_tick}, "
-              f"max_per_side={args.max_side or Config().max_side}")
+              f"max_per_side={args.max_side or Config().max_per_side}")
     print()
 
     try:

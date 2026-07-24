@@ -67,7 +67,8 @@ class OrderExecutor:
         )
         ws.lots.append(lot)
 
-        # If this was a pairing order, mark the paired lot.
+        # If this was a pairing order, mark the paired lot AND mirror the
+        # paired_qty on the fill-side lot so both sides reflect the truth.
         # Cap at lot.amount to guard against race: a cancelled pairing order's
         # in-flight fill and a replacement pairing order both incrementing the
         # same lot's paired_qty (see review bug #1).
@@ -76,6 +77,7 @@ class OrderExecutor:
                 if existing.lot_id == po.pairing_lot_id:
                     capped = min(fill_size, existing.amount - existing.paired_qty)
                     existing.paired_qty += capped
+                    lot.paired_qty += capped  # mirror on the fill lot
                     break
 
 
