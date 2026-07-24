@@ -15,13 +15,12 @@ emitted as typed dataclass events.  Subscribe with ``engine.on()``:
 
 Built-in subscribers:
   - LogSubscriber  → formatted logging (always active)
-  - CsvRecorder    → CSV trade log (paper mode only)
+  - SqliteRecorder → SQLite trade log (live mode)
 """
 
 from __future__ import annotations
 
 import asyncio
-import csv
 import logging
 import sqlite3
 import time
@@ -36,7 +35,7 @@ from polymarket.models.clob.market_events import (
 )
 
 from .client import SdkClient
-from .executors import OrderExecutor, PaperExecutor
+from .executors import LiveExecutor, OrderExecutor
 from .models import (
     Decision,
     MarketInfo,
@@ -134,13 +133,10 @@ class LogSubscriber:
         engine.on("window_end", self._on_win_end)
 
     async def _on_placed(self, ev: OrderPlaced):
-        tag = "PAPER" if ev.is_paper else "LIVE"
-        if ev.is_filled:
-            logger.info("    [%s] Buy %s %d @ %.4f  ✓ filled", tag, ev.outcome, ev.amount, ev.price)
-        elif ev.order_id:
-            logger.info("    [%s] Order %s %d @ %.4f  ID=%s…", tag, ev.outcome, ev.amount, ev.price, ev.order_id[:16])
+        if ev.order_id:
+            logger.info("    [LIVE] Order %s %d @ %.4f  ID=%s…", ev.outcome, ev.amount, ev.price, ev.order_id[:16])
         else:
-            logger.info("    [%s] Buy %s %d @ %.4f  — not filled", tag, ev.outcome, ev.amount, ev.price)
+            logger.info("    [LIVE] Buy %s %d @ %.4f  — not filled", ev.outcome, ev.amount, ev.price)
 
     async def _on_filled(self, ev: OrderFilled):
         logger.info("      ✓ Fill %s %d @ %.4f  (Up=%d Down=%d)",
@@ -182,47 +178,6 @@ class LogSubscriber:
             logger.info("    P&L:    $%+.2f", r["pnl"])
         logger.info("    Cum:    $%+.2f", ev.cum_pnl)
         logger.info("  ─" * 18)
-
-
-class CsvRecorder:
-    """Writes per-tick trade rows to a CSV file.
-
-    Subscribes to ``order_placed`` (for paper mode fills) and
-    ``window_end`` (for summary row).
-    """
-
-    def __init__(self, engine: TradingEngine, path: str):
-        self.path = path
-        self._handle = open(path, "w", newline="")
-        self._writer = csv.writer(self._handle)
-        self._writer.writerow([
-            "ts", "slug", "window", "type", "side", "price", "amount",
-            "inv_up", "inv_down", "pair_cost", "cum_pnl",
-        ])
-        engine.on("order_placed", self._on_placed)
-        engine.on("window_end", self._on_win_end)
-
-    def close(self):
-        self._handle.close()
-
-    async def _on_placed(self, ev: OrderPlaced):
-        if not ev.is_filled:
-            return
-        self._writer.writerow([
-            datetime.now(tz=timezone.utc).strftime("%H:%M:%S"),
-            "", ev.window_num, "fill", ev.outcome, ev.price, ev.amount,
-            "", "", "", "",
-        ])
-
-    async def _on_win_end(self, ev: WindowEnd):
-        r = ev.report
-        self._writer.writerow([
-            datetime.now(tz=timezone.utc).strftime("%H:%M:%S"),
-            ev.slug, ev.window_num, "settle", r.get("winner", ""), "", "",
-            r["inv_up"], r["inv_down"],
-            r["pair_cost"], ev.cum_pnl,
-        ])
-        self._handle.flush()
 
 
 class SqliteRecorder:
@@ -284,11 +239,10 @@ class SqliteRecorder:
 
     async def _on_placed(self, ev: OrderPlaced):
         now = datetime.now(tz=timezone.utc).isoformat()
-        status = "filled" if ev.is_filled else "placed"
         self._conn.execute(
             "INSERT INTO orders (window_num, outcome, side, price, amount, status, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (ev.window_num, ev.outcome, ev.side, ev.price, ev.amount, status, now),
+            (ev.window_num, ev.outcome, ev.side, ev.price, ev.amount, "placed", now),
         )
         self._conn.commit()
 
@@ -348,16 +302,15 @@ class TradingEngine:
 
     Usage::
 
-        engine = TradingEngine(cfg, PaperExecutor())
+        engine = TradingEngine(cfg, LiveExecutor())
         engine.on("order_filled", my_handler)
         await engine.run()
     """
 
     def __init__(self, cfg: Config, executor: OrderExecutor | None = None):
         self.cfg = cfg
-        self.executor = executor or PaperExecutor()
+        self.executor = executor or LiveExecutor()
         self.executor.engine = self
-        self.paper = isinstance(self.executor, PaperExecutor)
         self.sdk = SdkClient(cfg)
         self.prices = PriceCache()
         self.strategy = TemporalArbStrategy(cfg)
@@ -387,7 +340,6 @@ class TradingEngine:
 
         # Attach default subscribers
         self._log = LogSubscriber(self)
-        self._csv: Optional[CsvRecorder] = None
         self._sqlite: Optional[SqliteRecorder] = None
 
     def on(self, event_type: str, handler: Callable):
@@ -419,25 +371,16 @@ class TradingEngine:
         self._running = True
         if self.cfg.market_specs:
             spec = self.cfg.market_specs[0]
-            logger.info("Engine started (paper=%s, market=%s)",
-                        self.paper, spec.slug_pattern)
+            logger.info("Engine started (market=%s)", spec.slug_pattern)
         else:
-            logger.info("Engine started (paper=%s, no markets)", self.paper)
+            logger.info("Engine started (no markets)")
 
         # Create secure client for live trading
         await self.sdk.create_secure(self.cfg)
 
-        if self.paper:
-            csv_path = (
-                f"poly_trader_trades_"
-                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            )
-            self._csv = CsvRecorder(self, csv_path)
-            logger.info("CSV log: %s", csv_path)
-        else:
-            db_path = f"poly_trader_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-            self._sqlite = SqliteRecorder(self, db_path)
-            logger.info("SQLite log: %s", db_path)
+        db_path = f"poly_trader_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        self._sqlite = SqliteRecorder(self, db_path)
+        logger.info("SQLite log: %s", db_path)
 
         if not self.cfg.market_specs:
             logger.error("No market specs configured — nothing to trade")
@@ -450,8 +393,7 @@ class TradingEngine:
                 self._run_market_loop(spec),
                 name=f"market-{spec.slug_pattern}",
             )
-            if not self.paper:
-                tg.create_task(self._run_user_ws(), name="user-ws")
+            tg.create_task(self._run_user_ws(), name="user-ws")
 
     def stop(self):
         self._running = False
@@ -538,8 +480,6 @@ class TradingEngine:
             p = event.payload
             price_f = float(p.price)
             self.prices.update_trade(p.token_id, price_f)
-            # Match paper pending orders against real trades
-            await self.executor.on_trade(p.token_id, price_f)
 
     async def _run_user_ws(self):
         """Subscribe to authenticated user events for fill tracking (live only).
@@ -739,10 +679,6 @@ class TradingEngine:
                     pairing_lot_id=d.lot_id,
                 )
 
-            # Paper mode: periodic fill fallback (trade events may not arrive)
-            if self.paper and ws_state.pending_orders:
-                await self.executor.try_fill_pending(ws_state)
-
             if ws_state.is_full(self.cfg.max_per_side):
                 logger.info("[%s] Both sides full → idle until window end", market.slug)
                 await asyncio.sleep(max(0.0, window_end - time.time() - 1))
@@ -829,8 +765,7 @@ class TradingEngine:
         pairing-aggressiveness reference price computed from the raw
         orderbook snapshot.
 
-        Calls executor.cancel() so the cancellation happens on the exchange
-        (live mode) or locally (paper mode).
+        Calls executor.cancel() so the cancellation happens on the exchange.
         """
         threshold = self.cfg.cancel_replace_threshold
         min_age = self.cfg.cancel_min_age

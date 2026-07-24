@@ -2,13 +2,12 @@
 Polymarket WebSocket Temporal Arbitrage Bot — CLI entry point.
 
 Usage:
-  python -m poly_trader info                  # query current markets
-  python -m poly_trader paper                 # paper trade (simulated fills)
-  python -m poly_trader run                   # live trade (real orders)
+  python -m poly_trader info                   # query current markets
+  python -m poly_trader run                    # live trade (real orders)
+  python -m poly_trader check                  # verify credentials
 
-  python -m poly_trader paper --per-tick 10 --max-side 500
-  python -m poly_trader paper --market btc-updown-15m
-  python -m poly_trader run --market btc-updown-5m
+  python -m poly_trader run --per-tick 5 --max-side 20
+  python -m poly_trader run --market btc-updown-15m
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ import sys
 
 from .config import Config
 from .engine import TradingEngine
-from .executors import LiveExecutor, PaperExecutor
+from .executors import LiveExecutor
 from .models import MarketSpec
 
 logger = logging.getLogger("poly_trader")
@@ -51,16 +50,15 @@ def parse_market_spec(pattern: str) -> MarketSpec:
 async def async_main(args: argparse.Namespace):
     cfg = Config()
 
-    # Live mode: conservative defaults + credential check
     if args.mode == "run":
         if not cfg.private_key:
             print("ERROR: Live mode requires POLY_PRIVATE_KEY environment variable")
             print("See config.py for all credential options")
             sys.exit(1)
+
+    if args.per_tick is not None:
         cfg.per_tick = args.per_tick
-        cfg.max_per_side = args.max_side
-    else:
-        cfg.per_tick = args.per_tick
+    if args.max_side is not None:
         cfg.max_per_side = args.max_side
 
     if args.market:
@@ -76,11 +74,11 @@ async def async_main(args: argparse.Namespace):
         return
 
     if not cfg.market_specs:
-        print("ERROR: --market is required in paper/run mode")
-        print("  e.g. python -m poly_trader paper --market btc-updown-15m")
+        print("ERROR: --market is required in run mode")
+        print("  e.g. python -m poly_trader run --market btc-updown-15m")
         sys.exit(1)
 
-    engine = TradingEngine(cfg, executor=PaperExecutor() if args.mode == "paper" else LiveExecutor())
+    engine = TradingEngine(cfg, executor=LiveExecutor())
     try:
         await engine.run()
     except asyncio.CancelledError:
@@ -128,16 +126,16 @@ def main():
     )
     parser.add_argument(
         "mode", nargs="?", default="info",
-        choices=["info", "paper", "run", "check"],
-        help="info=query market, paper=simulate, run=live trading, check=verify credentials",
+        choices=["info", "run", "check"],
+        help="info=query market, run=live trading, check=verify credentials",
     )
-    parser.add_argument("--per-tick", type=int, default=5,
-                        help="max contracts per tick per side (default: 5)")
-    parser.add_argument("--max-side", type=int, default=500,
-                        help="max position per side (default: 500)")
+    parser.add_argument("--per-tick", type=int, default=None,
+                        help="max contracts per tick per side")
+    parser.add_argument("--max-side", type=int, default=None,
+                        help="max position per side")
     parser.add_argument(
         "--market", type=str, default=None,
-        help='Market slug pattern, e.g. "btc-updown-15m" (required for paper/run)',
+        help='Market slug pattern, e.g. "btc-updown-15m" (required for run)',
     )
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="debug-level logging")
@@ -145,16 +143,16 @@ def main():
 
     setup_logging(args.verbose)
 
-    # Print banner
-    mode = "Paper" if args.mode == "paper" else ("Live" if args.mode == "run" else ("Check" if args.mode == "check" else "Info"))
+    mode_label = {"info": "Info", "run": "Live", "check": "Credential Check"}.get(args.mode, args.mode)
     spec = parse_market_spec(args.market) if args.market else None
     print(f"{'═' * 50}")
-    print(f"  Polymarket Temporal Arbitrage — {mode} Mode")
+    print(f"  Polymarket Temporal Arbitrage — {mode_label} Mode")
     print(f"{'═' * 50}")
     if spec:
         print(f"  {spec} [{spec.slug_pattern}]")
-    if args.mode != "check":
-        print(f"  per_tick={args.per_tick}, max_per_side={args.max_side}")
+    if args.mode == "run":
+        print(f"  per_tick={args.per_tick or Config().per_tick}, "
+              f"max_per_side={args.max_side or Config().max_side}")
     print()
 
     try:

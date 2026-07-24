@@ -257,8 +257,6 @@ class OrderPlaced:
     price: float
     amount: int
     order_id: str = ""
-    is_paper: bool = True
-    is_filled: bool = False  # paper: immediately known
 
 
 @dataclass
