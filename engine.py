@@ -626,20 +626,28 @@ class TradingEngine:
             up_price = self.sdk.round_to_tick(up_price, up_tick)
             down_price = self.sdk.round_to_tick(down_price, down_tick)
 
-            # Stop adding if guaranteed PnL drops too far negative —
-            # means unpaired fills are piling up cost without completing pairs.
-            # Only activates after min_pair_cost_fills to avoid early-spike false kills.
-            if (ws_state.trades >= self.cfg.min_pair_cost_fills
-                    and ws_state.guaranteed_pairs > 0
-                    and ws_state.guaranteed_pnl < -ws_state.guaranteed_pairs * 0.50):
-                logger.info(
-                    "[%s] Guaranteed PnL %.2f < -50%% of pairs (%d) → stop adding, cancelling…",
-                    market.slug, ws_state.guaranteed_pnl, ws_state.guaranteed_pairs)
-                await self.executor.cancel_all(ws_state.pending_orders)
-                # cancel_all handles flush internally; remaining are edge-case stragglers
-                ws_state.pending_orders.clear()
-                await asyncio.sleep(max(0.0, window_end - time.time() - 1))
-                break
+            # Kill-switch: stop adding if pair economics are broken.
+            # Two triggers (either is sufficient):
+            #   1) pair_cost > max_pair_cost — completed pairs are unprofitable
+            #   2) guaranteed_pnl < -pairs × kill_pnl_per_pair — imbalance damage
+            if ws_state.trades >= self.cfg.min_pair_cost_fills and ws_state.guaranteed_pairs > 0:
+                kill_reason: str | None = None
+                if ws_state.pair_cost > self.cfg.max_pair_cost:
+                    kill_reason = f"pair_cost {ws_state.pair_cost:.4f} > {self.cfg.max_pair_cost}"
+                elif ws_state.guaranteed_pnl < -ws_state.guaranteed_pairs * self.cfg.kill_pnl_per_pair:
+                    kill_reason = (
+                        f"guaranteed_pnl {ws_state.guaranteed_pnl:.2f} < "
+                        f"-{ws_state.guaranteed_pairs}×{self.cfg.kill_pnl_per_pair} "
+                        f"(= { -ws_state.guaranteed_pairs * self.cfg.kill_pnl_per_pair:.2f})"
+                    )
+                if kill_reason:
+                    logger.info(
+                        "[%s] Kill-switch: %s → stop adding, cancelling…",
+                        market.slug, kill_reason)
+                    await self.executor.cancel_all(ws_state.pending_orders)
+                    ws_state.pending_orders.clear()
+                    await asyncio.sleep(max(0.0, window_end - time.time() - 1))
+                    break
 
             # Cancel-replace: reprice stale pending orders
             # Flush soft-deleted orders from previous cancel cycles first
@@ -784,7 +792,14 @@ class TradingEngine:
                 snap = up_snap if po.side == "Up" else down_snap
                 if not snap or not snap.best_bid or not snap.best_ask:
                     continue
-                current_price = snap.best_bid + snap.spread * self.cfg.pairing_aggressiveness
+                raw = snap.best_bid + snap.spread * self.cfg.pairing_aggressiveness
+                # Apply the same max_pair_cost cap as strategy.decide()
+                lot = next((l for l in ws.lots if l.lot_id == po.pairing_lot_id), None)
+                if lot is not None:
+                    cap = self.cfg.max_pair_cost - lot.price
+                    current_price = round(min(raw, cap), 4)
+                else:
+                    current_price = raw
             else:
                 current_price = up_price if po.side == "Up" else down_price
             max_p = max(po.price, 0.001)

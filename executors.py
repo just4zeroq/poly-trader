@@ -88,11 +88,21 @@ class LiveExecutor(OrderExecutor):
         ws = self.engine._windows.get(slug)
         if ws is None:
             return None
-        # One pending order per side at a time (defence in depth; strategy
-        # already enforces this, but the executor should not trust blindly).
-        if any(po.side == outcome and po.cancelled_at == 0
-               for po in ws.pending_orders.values()):
-            return None
+        # Enforce one pending order per side per *role*.
+        # Pairing orders (pairing_lot_id is not None) have priority: they can
+        # coexist alongside a cheap order on the same side.  Cheap orders are
+        # blocked by any existing order (cheap or pairing) on the same side.
+        if pairing_lot_id is not None:
+            # Pairing — only block if another pairing order exists on this side
+            if any(po.side == outcome and po.cancelled_at == 0
+                   and po.pairing_lot_id is not None
+                   for po in ws.pending_orders.values()):
+                return None
+        else:
+            # Cheap — blocked by any pending order on this side
+            if any(po.side == outcome and po.cancelled_at == 0
+                   for po in ws.pending_orders.values()):
+                return None
         oid = await self.engine.sdk.place_limit_order(
             token_id=token_id, side="BUY",
             price=price, size=amount,
@@ -204,4 +214,4 @@ class LiveExecutor(OrderExecutor):
                 ))
                 if po.remaining <= 0:
                     del ws.pending_orders[oid]
-                return  # order ID is unique — stop scanning
+                break  # found the order — stop scanning windows, next maker_order

@@ -98,6 +98,8 @@ class Config:
     max_spread: float = field(default_factory=lambda: _env_float("max_spread", 0.05))
     max_pair_cost: float = field(default_factory=lambda: _env_float("max_pair_cost", 0.9999))
     min_pair_cost_fills: int = field(default_factory=lambda: _env_int("min_pair_cost_fills", 2))
+    kill_pnl_per_pair: float = field(default_factory=lambda: _env_float("kill_pnl_per_pair", 0.03))
+    """Stop adding when guaranteed_pnl < -pairs × this (imbalance damage threshold)."""
     max_drawdown: float = field(default_factory=lambda: _env_float("max_drawdown", -10.0))
     stop_on_window_loss: bool = field(default_factory=lambda: _env_bool("stop_on_window_loss", True))
 
