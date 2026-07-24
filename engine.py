@@ -172,11 +172,12 @@ class LogSubscriber:
         logger.info("  Window #%d  %s", ev.window_num, ev.slug)
         logger.info("    Up:     %d @ %.4f", r["inv_up"], r["avg_up"])
         logger.info("    Down:   %d @ %.4f", r["inv_down"], r["avg_down"])
-        logger.info("    Pair:   $%.4f  %s",
-                    r["pair_cost"], "< $1 ✓" if r["pair_cost"] < 1 else "> $1 ✗")
+        logger.info("    Pairs:  %d   Imbalance: %d   Guaranteed PnL: $%+.2f",
+                    r["pairs"], r["imbalance"], r["guaranteed_pnl"])
         logger.info("    Spent:  $%.2f", r["total_spent"])
         if r["winner"]:
-            logger.info("    Winner: %s → payout $%d", r["winner"], r["inv_up" if r["winner"] == "Up" else "inv_down"])
+            logger.info("    Winner: %s → payout $%d",
+                        r["winner"], r["inv_up" if r["winner"] == "Up" else "inv_down"])
             logger.info("    P&L:    $%+.2f", r["pnl"])
         logger.info("    Cum:    $%+.2f", ev.cum_pnl)
         logger.info("  ─" * 18)
@@ -684,12 +685,15 @@ class TradingEngine:
             up_price = self.sdk.round_to_tick(up_price, up_tick)
             down_price = self.sdk.round_to_tick(down_price, down_tick)
 
-            # Stop adding if average pair cost is too high.
+            # Stop adding if guaranteed PnL drops too far negative —
+            # means unpaired fills are piling up cost without completing pairs.
             # Only activates after min_pair_cost_fills to avoid early-spike false kills.
             if (ws_state.trades >= self.cfg.min_pair_cost_fills
-                    and ws_state.pair_cost > self.cfg.max_pair_cost):
-                logger.info("[%s] Pair cost %.4f > %.4f → stop adding, cancelling pending…",
-                            market.slug, ws_state.pair_cost, self.cfg.max_pair_cost)
+                    and ws_state.guaranteed_pairs > 0
+                    and ws_state.guaranteed_pnl < -ws_state.guaranteed_pairs * 0.50):
+                logger.info(
+                    "[%s] Guaranteed PnL %.2f < -50%% of pairs (%d) → stop adding, cancelling…",
+                    market.slug, ws_state.guaranteed_pnl, ws_state.guaranteed_pairs)
                 await self.executor.cancel_all(ws_state.pending_orders)
                 ws_state.pending_orders.clear()
                 await asyncio.sleep(max(0.0, window_end - time.time() - 1))

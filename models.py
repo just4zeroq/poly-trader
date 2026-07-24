@@ -164,6 +164,21 @@ class WindowState:
         return self.avg_cost_up + self.avg_cost_down
 
     @property
+    def guaranteed_pairs(self) -> int:
+        """Number of completed (Up, Down) pairs — the real unit of profit."""
+        return min(self.inventory["Up"], self.inventory["Down"])
+
+    @property
+    def imbalance(self) -> int:
+        """Unpaired exposure: |N_up − N_down|."""
+        return abs(self.inventory["Up"] - self.inventory["Down"])
+
+    @property
+    def guaranteed_pnl(self) -> float:
+        """PnL from completed pairs only: min(N_up, N_down) − total_spent."""
+        return self.guaranteed_pairs - self.total_spent
+
+    @property
     def total_contracts(self) -> int:
         return self.inventory["Up"] + self.inventory["Down"]
 
@@ -179,6 +194,9 @@ class WindowState:
             "inv_down": self.inventory["Down"],
             "avg_up": round(self.avg_cost_up, 4),
             "avg_down": round(self.avg_cost_down, 4),
+            "pairs": self.guaranteed_pairs,
+            "imbalance": self.imbalance,
+            "guaranteed_pnl": round(self.guaranteed_pnl, 2),
             "pair_cost": round(self.pair_cost, 4),
             "total_spent": round(self.total_spent, 2),
             "pnl": round(pnl, 2) if pnl is not None else None,

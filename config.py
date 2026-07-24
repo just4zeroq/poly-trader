@@ -90,6 +90,8 @@ class Config:
 
     # ── Risk ──
     min_order_size: int = field(default_factory=lambda: _env_int("min_order_size", 5))
+    max_imbalance: int = field(default_factory=lambda: _env_int("max_imbalance", 10))
+    """Hard cap on |N_up − N_down| — unpaired exposure limit."""
     max_price_dev: float = field(default_factory=lambda: _env_float("max_price_dev", 0.20))
     max_spread: float = field(default_factory=lambda: _env_float("max_spread", 0.05))
     max_pair_cost: float = field(default_factory=lambda: _env_float("max_pair_cost", 0.9999))
