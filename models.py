@@ -118,6 +118,7 @@ class PendingOrder:
     amount: int
     filled: int = 0
     placed_at: float = 0.0
+    cancelled_at: float = 0.0  # soft-delete timestamp; > 0 means cancel requested
 
     @property
     def remaining(self) -> int:

@@ -695,11 +695,14 @@ class TradingEngine:
                     "[%s] Guaranteed PnL %.2f < -50%% of pairs (%d) → stop adding, cancelling…",
                     market.slug, ws_state.guaranteed_pnl, ws_state.guaranteed_pairs)
                 await self.executor.cancel_all(ws_state.pending_orders)
+                # cancel_all handles flush internally; remaining are edge-case stragglers
                 ws_state.pending_orders.clear()
                 await asyncio.sleep(max(0.0, window_end - time.time() - 1))
                 break
 
             # Cancel-replace: reprice stale pending orders
+            # Flush soft-deleted orders from previous cancel cycles first
+            await self.executor.flush_cancelled()
             await self._cancel_stale_pending(ws_state, up_price, down_price)
 
             up_snap = self.prices.get(market.up_token_id)
@@ -823,6 +826,9 @@ class TradingEngine:
         now = time.time()
         for oid in list(ws.pending_orders):
             po = ws.pending_orders[oid]
+            # Skip already-cancelled orders (awaiting grace-period flush)
+            if po.cancelled_at > 0:
+                continue
             # Guard 1: let fresh orders sit on the book
             if now - po.placed_at < min_age:
                 continue
@@ -846,6 +852,7 @@ class TradingEngine:
 
         # Cancel remaining pending orders
         await self.executor.cancel_all(ws.pending_orders)
+        # cancel_all handles flush internally; remaining are edge-case stragglers
         ws.pending_orders.clear()
 
         # Determine winner — prefer Gamma API (actual resolution), fall back to WS midpoints

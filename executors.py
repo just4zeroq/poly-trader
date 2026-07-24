@@ -60,6 +60,10 @@ class OrderExecutor:
         for oid in list(pending_orders):
             await self.cancel(oid)
 
+    async def flush_cancelled(self, grace: float = 5.0):
+        """Remove soft-deleted orders past grace period. No-op in base."""
+        pass
+
 
 class PaperExecutor(OrderExecutor):
     """Paper trading — orders sit pending until matched by real WS trades."""
@@ -209,13 +213,22 @@ class LiveExecutor(OrderExecutor):
         return None
 
     async def cancel(self, order_id: str) -> bool:
+        """Soft-delete: mark cancelled_at instead of deleting immediately.
+
+        SDK cancel_order returning True means the CLOB accepted the cancel
+        request.  The fill may still be in-flight — UserTradeEvent could
+        arrive after this returns.  By keeping the order in pending_orders
+        with cancelled_at set, _handle_trade can still match it and correctly
+        update inventory/cost.  flush_cancelled() removes them after the
+        grace period.
+        """
         ok = await self.engine.sdk.cancel_order(order_id)
         if ok:
             for ws in list(self.engine._windows.values()):
                 po = ws.pending_orders.get(order_id)
                 if po is None:
                     continue
-                del ws.pending_orders[order_id]
+                po.cancelled_at = time.time()
                 await self.engine._emit("order_cancelled", OrderCancelled(
                     window_num=ws.window_num,
                     outcome=po.side, amount=po.remaining,
@@ -225,8 +238,25 @@ class LiveExecutor(OrderExecutor):
         return ok
 
     async def cancel_all(self, pending_orders: dict[str, PendingOrder]):
-        await super().cancel_all(pending_orders)
-        await asyncio.sleep(1)
+        """Soft-cancel all pending orders, wait for in-flight fills, then flush."""
+        for oid in list(pending_orders):
+            await self.cancel(oid)
+        # Give in-flight fills time to arrive via UserTradeEvent
+        await asyncio.sleep(3)
+        # Remove soft-deleted orders (grace=0 because we already waited above)
+        await self.flush_cancelled(grace=0.0)
+        # Force-clear any stragglers (failed cancels that couldn't be soft-deleted)
+        for oid in list(pending_orders):
+            pending_orders.pop(oid, None)
+
+    async def flush_cancelled(self, grace: float = 5.0):
+        """Remove soft-deleted orders whose grace period has elapsed."""
+        now = time.time()
+        for ws in list(self.engine._windows.values()):
+            for oid in list(ws.pending_orders):
+                po = ws.pending_orders[oid]
+                if po.cancelled_at > 0 and now - po.cancelled_at > grace:
+                    del ws.pending_orders[oid]
 
     async def handle_user_event(self, event):
         """Process authenticated user channel events for fill tracking."""
