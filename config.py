@@ -21,7 +21,7 @@ else:
 
 def _env(key: str, default: str = "") -> str:
     """Read POLY_{KEY}, fall back to POLYMARKET_{KEY} alias."""
-    val = os.environ.get(f"POLY_{key}")
+    val = os.environ.get(f"POLY_{key.upper()}")
     if val:
         return val
     alias = _ENV_ALIASES.get(key)

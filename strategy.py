@@ -108,8 +108,8 @@ class TemporalArbStrategy:
             cap = self.cfg.max_pair_cost - lot.price
             price = round(min(raw, cap), 4)
 
-            # Hard condition: lot.cost + price < max_pair_cost
-            if lot.price + price >= self.cfg.max_pair_cost:
+            # Hard condition: lot.cost + price <= max_pair_cost (allow boundary)
+            if lot.price + price > self.cfg.max_pair_cost:
                 continue
 
             # Price must be within the book

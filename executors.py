@@ -77,11 +77,15 @@ class OrderExecutor:
         )
         ws.lots.append(lot)
 
-        # If this was a pairing order, mark the paired lot
+        # If this was a pairing order, mark the paired lot.
+        # Cap at lot.amount to guard against race: a cancelled pairing order's
+        # in-flight fill and a replacement pairing order both incrementing the
+        # same lot's paired_qty (see review bug #1).
         if po.pairing_lot_id:
             for existing in ws.lots:
                 if existing.lot_id == po.pairing_lot_id:
-                    existing.paired_qty += fill_size
+                    capped = min(fill_size, existing.amount - existing.paired_qty)
+                    existing.paired_qty += capped
                     break
 
 
@@ -216,6 +220,11 @@ class LiveExecutor(OrderExecutor):
                     pairing_lot_id: str | None = None) -> Optional[str]:
         ws = self.engine._windows.get(slug)
         if ws is None:
+            return None
+        # One pending order per side at a time (defence in depth; strategy
+        # already enforces this, but the executor should not trust blindly).
+        if any(po.side == outcome and po.cancelled_at == 0
+               for po in ws.pending_orders.values()):
             return None
         oid = await self.engine.sdk.place_limit_order(
             token_id=token_id, side="BUY",

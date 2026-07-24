@@ -704,10 +704,11 @@ class TradingEngine:
             # Cancel-replace: reprice stale pending orders
             # Flush soft-deleted orders from previous cancel cycles first
             await self.executor.flush_cancelled()
-            await self._cancel_stale_pending(ws_state, up_price, down_price)
-
             up_snap = self.prices.get(market.up_token_id)
             down_snap = self.prices.get(market.down_token_id)
+            await self._cancel_stale_pending(ws_state, up_price, down_price,
+                                             up_snap, down_snap)
+
             decisions = self.strategy.decide(
                 ws_state, up_price, down_price,
                 remaining_time=remaining,
@@ -818,14 +819,15 @@ class TradingEngine:
             return snap.best_bid or snap.best_ask or 0.0
         return round(snap.best_bid + snap.spread * self.cfg.aggressiveness, 4)
 
-    async def _cancel_stale_pending(self, ws: WindowState, up_price: float, down_price: float):
+    async def _cancel_stale_pending(self, ws: WindowState, up_price: float,
+                                     down_price: float,
+                                     up_snap=None, down_snap=None):
         """Cancel pending orders whose price has moved beyond the threshold.
 
-        Two guards:
-          1. Minimum order age — don't cancel freshly placed orders
-             (gives them time to fill before being repriced).
-          2. Price deviation threshold — cancel only when price has moved
-             significantly from the order's original price.
+        For cheap-seeker orders, compares against the cheap-aggressiveness
+        reference price.  For pairing orders, compares against the
+        pairing-aggressiveness reference price computed from the raw
+        orderbook snapshot.
 
         Calls executor.cancel() so the cancellation happens on the exchange
         (live mode) or locally (paper mode).
@@ -841,8 +843,15 @@ class TradingEngine:
             # Guard 1: let fresh orders sit on the book
             if now - po.placed_at < min_age:
                 continue
-            # Guard 2: only cancel if price moved beyond threshold
-            current_price = up_price if po.side == "Up" else down_price
+            # Guard 2: compute reference price using the order's own role
+            if po.pairing_lot_id is not None:
+                # Pairing order — use pairing aggressiveness from raw snap
+                snap = up_snap if po.side == "Up" else down_snap
+                if not snap or not snap.best_bid or not snap.best_ask:
+                    continue
+                current_price = snap.best_bid + snap.spread * self.cfg.pairing_aggressiveness
+            else:
+                current_price = up_price if po.side == "Up" else down_price
             max_p = max(po.price, 0.001)
             if abs(po.price - current_price) / max_p > threshold:
                 await self.executor.cancel(oid)
