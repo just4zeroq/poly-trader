@@ -16,8 +16,11 @@ import time
 
 import aiohttp
 
-from .config import DEFAULT_MARKET_SPECS
 from .models import MarketSpec
+
+DEFAULT_MARKET_SPECS = [
+    MarketSpec(symbol="BTC", duration_min=15, slug_pattern="btc-updown-15m"),
+]
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 

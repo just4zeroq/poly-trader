@@ -98,7 +98,6 @@ class TemporalArbStrategy:
 
         # Ensure total doesn't exceed per_tick by more than 1
         if up_buy + down_buy > per_tick + 1:
-            # Scale back proportionally
             scale = per_tick / (up_buy + down_buy)
             up_buy = max(1, int(up_buy * scale))
             down_buy = max(1, int(down_buy * scale))
@@ -106,11 +105,5 @@ class TemporalArbStrategy:
         # Apply capacity limits
         up_buy = min(up_buy, up_cap)
         down_buy = min(down_buy, down_cap)
-
-        # Enforce minimum order size
-        if 0 < up_buy < min_size:
-            up_buy = 0
-        if 0 < down_buy < min_size:
-            down_buy = 0
 
         return (up_buy, down_buy)
