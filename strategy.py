@@ -99,38 +99,6 @@ class TemporalArbStrategy:
 
             pair_side = "Up" if lot.side == "Down" else "Down"
 
-            # Side taken — if it's a cheap order, cancel and replace.
-            # If it's another pairing order, skip.
-            cancel_cheap_oid: str | None = None
-            if pair_side == "Up" and pending_up:
-                cancel_cheap_oid = next(
-                    (oid for oid, po in ws.pending_orders.items()
-                     if po.side == "Up" and po.cancelled_at == 0
-                     and po.pairing_lot_id is None),
-                    None,
-                )
-                if cancel_cheap_oid:
-                    logger.info("  [pairer] overriding cheap %s order %s for lot %s",
-                                pair_side, cancel_cheap_oid, lot.lot_id)
-                else:
-                    logger.info("  [pairer] skip lot %s: %s side taken by pairing order",
-                                lot.lot_id, pair_side)
-                    continue
-            if pair_side == "Down" and pending_down:
-                cancel_cheap_oid = next(
-                    (oid for oid, po in ws.pending_orders.items()
-                     if po.side == "Down" and po.cancelled_at == 0
-                     and po.pairing_lot_id is None),
-                    None,
-                )
-                if cancel_cheap_oid:
-                    logger.info("  [pairer] overriding cheap %s order %s for lot %s",
-                                pair_side, cancel_cheap_oid, lot.lot_id)
-                else:
-                    logger.info("  [pairer] skip lot %s: %s side taken by pairing order",
-                                lot.lot_id, pair_side)
-                    continue
-
             # max_per_side check
             if pair_side == "Up" and inv_up >= max_side:
                 continue
@@ -169,6 +137,25 @@ class TemporalArbStrategy:
                 logger.info("  [pairer] qty %d < min %d for lot %s — skip",
                             qty, self.cfg.min_order_size, lot.lot_id)
                 continue
+
+            # ── Side-taken check (after price/qty checks pass) ──
+            # If target side is blocked by a pairing order, skip.
+            # If blocked by a cheap order, cancel it and replace.
+            cancel_cheap_oid: str | None = None
+            target_blocked = False
+            for oid, po in ws.pending_orders.items():
+                if po.side == pair_side and po.cancelled_at == 0:
+                    if po.pairing_lot_id is not None:
+                        target_blocked = True
+                        break
+                    cancel_cheap_oid = oid
+            if target_blocked:
+                logger.info("  [pairer] skip lot %s: %s side taken by pairing order",
+                            lot.lot_id, pair_side)
+                continue
+            if cancel_cheap_oid:
+                logger.info("  [pairer] overriding cheap %s order %s for lot %s",
+                            pair_side, cancel_cheap_oid, lot.lot_id)
 
             decisions.append(Decision(
                 side=pair_side,
