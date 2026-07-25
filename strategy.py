@@ -4,19 +4,15 @@ Two-role strategy: Pairer (close exposure) + Cheap-seeker (open new positions).
 Core idea:
   - **Pairer**: Every tick, find the cheapest unpaired lot and try to pair it
     at a slightly more aggressive maker price (aggressiveness=0.5).
-    Constraint: lot.cost + maker_price < max_pair_cost (0.9999).
+    Constraint: lot.cost + maker_price < max_pair_cost (0.98).
     Qty is NOT limited by lot.unpaired_qty — the lot only provides the
     cost-basis for the price cap.  Always runs.
-
-  - **Residual flipper**: If pairer couldn't place and imbalance is 3-4,
-    buy 5 on the underweight side to flip the residual to 1-2.  Not
-    constrained by max_per_side.
 
   - **Cheap-seeker**: Buy the cheaper side each tick at a conservative maker
     price (aggressiveness=0.2).  Pauses when imbalance >= K AND cheap side
     equals the overweight side (trend protection).
 
-Conflict: pairer > residual flipper > cheap-seeker.
+Conflict: pairer > cheap-seeker.
 """
 
 from __future__ import annotations
@@ -90,6 +86,14 @@ class TemporalArbStrategy:
         )
 
         for lot in unpaired:
+            # Don't pair if the lot's side still has pending orders
+            # (position still building — wait for full fill first)
+            if any(
+                po.side == lot.side and po.cancelled_at == 0
+                for po in ws.pending_orders.values()
+            ):
+                continue
+
             pair_side = "Up" if lot.side == "Down" else "Down"
 
             # Side taken by existing pending order?
@@ -121,10 +125,9 @@ class TemporalArbStrategy:
             if price < snap.best_bid or price > snap.best_ask:
                 continue
 
-            # Quantity: NOT limited by lot.unpaired_qty — the lot is only
-            # a price anchor.  Excess qty naturally creates a new lot on
-            # the opposite side that will be paired later.
-            qty = min(per_tick, max_side - (inv_up if pair_side == "Up" else inv_down))
+            # Only pair what the lot actually has unpaired — no over-pairing.
+            qty = min(per_tick, lot.unpaired_qty,
+                      max_side - (inv_up if pair_side == "Up" else inv_down))
             if qty < self.cfg.min_order_size:
                 continue
 
@@ -143,44 +146,29 @@ class TemporalArbStrategy:
                 pending_down = True
             break  # One pairing decision per tick
 
-        # ── Residual flipper ──
-        # If the pairer couldn't close and imbalance is 3-4, buy 5 on the
-        # underweight side to flip the residual to 1-2.  Not constrained by
-        # max_per_side — exposure reduction takes priority.
-        if not decisions and overweight is not None and 3 <= imbalance <= 4:
-            flip_side = underweight
-            blocked = (flip_side == "Up" and pending_up) or (flip_side == "Down" and pending_down)
-            if not blocked:
-                snap = up_snap if flip_side == "Up" else down_snap
-                if snap.best_bid and snap.best_ask:
-                    price = round(snap.best_bid + snap.spread * self.cfg.pairing_aggressiveness, 4)
-                    if per_tick >= self.cfg.min_order_size:
-                        decisions.append(Decision(
-                            side=flip_side,
-                            amount=per_tick,
-                            price=price,
-                            role="pairing",
-                            lot_id=None,
-                        ))
-                        if flip_side == "Up":
-                            pending_up = True
-                        else:
-                            pending_down = True
-
         # ══════════════════════════════════════════════════════════
         # Role 3 — Cheap-seeker
         # ══════════════════════════════════════════════════════════
 
+        # Pair-before-open: when imbalance exists, buy underweight side
+        # instead of the cheapest side, to reduce exposure.
+        if imbalance > 0 and underweight is not None:
+            cheap = underweight
+
         # Guard 1: stop opening new positions in the final minutes
         if remaining_time >= self.cfg.min_remaining_time:
-            # Guard 2: trend protection — don't add to the overweight side
+            # Guard 2: minimum price edge — skip near-50/50 prices
+            if abs(up_price - down_price) < self.cfg.min_edge:
+                return decisions
+
+            # Guard 3: trend protection + early brake at K/2
             trend_stopped = (
-                imbalance >= max_imb
-                and overweight is not None
+                overweight is not None
                 and cheap == overweight
+                and imbalance >= max_imb // 2
             )
             if not trend_stopped:
-                # Guard 3: side already claimed (by pairer or existing pending)
+                # Guard 4: side already claimed (by pairer or existing pending)
                 side_blocked = (cheap == "Up" and pending_up) or (cheap == "Down" and pending_down)
                 side_full = (cheap == "Up" and inv_up >= max_side) or (cheap == "Down" and inv_down >= max_side)
 
@@ -190,13 +178,24 @@ class TemporalArbStrategy:
                         price = round(
                             snap.best_bid + snap.spread * self.cfg.aggressiveness, 4,
                         )
-                        # Guard 4: don't buy if the resulting lot would be
-                        # unpairable — use the pairer's actual aggressiveness
-                        # to estimate the opposite-side pairing price.
-                        opp_snap = down_snap if cheap == "Up" else up_snap
-                        if opp_snap and opp_snap.best_bid and opp_snap.best_ask:
-                            opp_pairing_price = opp_snap.best_bid + opp_snap.spread * self.cfg.pairing_aggressiveness
-                            if price + opp_pairing_price > self.cfg.max_pair_cost:
+                        # Clamp: post-only BUY must not cross best_ask
+                        if price >= snap.best_ask:
+                            price = snap.best_bid
+                        # Guard 4: match price against existing unpaired opposite-side lots.
+                        # Sort by price descending (most expensive first), try each.
+                        # Skip if none can pair profitably.
+                        opposite_side = "Down" if cheap == "Up" else "Up"
+                        unpaired_opp = [
+                            l for l in ws.lots
+                            if l.side == opposite_side and l.unpaired_qty > 0
+                        ]
+                        if unpaired_opp:
+                            unpaired_opp.sort(key=lambda l: l.price, reverse=True)
+                            can_pair = any(
+                                price + lot.price <= self.cfg.max_pair_cost
+                                for lot in unpaired_opp
+                            )
+                            if not can_pair:
                                 return decisions
 
                         qty = min(per_tick, max_side - (inv_up if cheap == "Up" else inv_down))

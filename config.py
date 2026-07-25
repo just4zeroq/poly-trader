@@ -94,6 +94,8 @@ class Config:
     min_order_size: int = field(default_factory=lambda: _env_int("min_order_size", 5))
     max_imbalance: int = field(default_factory=lambda: _env_int("max_imbalance", 10))
     """Hard cap on |N_up − N_down| — unpaired exposure limit."""
+    min_edge: float = field(default_factory=lambda: _env_float("min_edge", 0.05))
+    """Skip cheap-seeker buy when |Up − Down| price difference is below this threshold."""
     max_price_dev: float = field(default_factory=lambda: _env_float("max_price_dev", 0.20))
     max_spread: float = field(default_factory=lambda: _env_float("max_spread", 0.05))
     max_extreme_price: float = field(default_factory=lambda: _env_float("max_extreme_price", 0.90))

@@ -207,8 +207,15 @@ class WindowState:
 
     @property
     def guaranteed_pnl(self) -> float:
-        """PnL from completed pairs only: min(N_up, N_down) − total_spent."""
-        return self.guaranteed_pairs - self.total_spent
+        """PnL from completed pairs only: paired contracts' settlement value minus their cost.
+
+        Uses lot-level paired_qty tracking so unpaired contracts' costs are
+        excluded — total_spent includes the full inventory (both paired and
+        unpaired), which would unfairly make guaranteed_pnl always negative
+        whenever there is any imbalance.
+        """
+        paired_cost = sum(l.price * l.paired_qty for l in self.lots)
+        return self.guaranteed_pairs - paired_cost
 
     @property
     def total_contracts(self) -> int:

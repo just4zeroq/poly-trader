@@ -627,24 +627,19 @@ class TradingEngine:
             up_price = self.sdk.round_to_tick(up_price, up_tick)
             down_price = self.sdk.round_to_tick(down_price, down_tick)
 
-            # Kill-switch: stop adding if pair economics are broken.
-            # Two triggers (either is sufficient):
-            #   1) pair_cost > max_pair_cost — completed pairs are unprofitable
-            #   2) guaranteed_pnl < -pairs × kill_pnl_per_pair — imbalance damage
+            # Kill-switch: stop adding when guaranteed PnL is too negative.
+            # pair_cost check is now handled tick-level in strategy.py (Guard 4).
             if ws_state.trades >= self.cfg.min_pair_cost_fills and ws_state.guaranteed_pairs > 0:
-                kill_reason: str | None = None
-                if ws_state.pair_cost > self.cfg.max_pair_cost:
-                    kill_reason = f"pair_cost {ws_state.pair_cost:.4f} > {self.cfg.max_pair_cost}"
-                elif ws_state.guaranteed_pnl < -ws_state.guaranteed_pairs * self.cfg.kill_pnl_per_pair:
-                    kill_reason = (
-                        f"guaranteed_pnl {ws_state.guaranteed_pnl:.2f} < "
-                        f"-{ws_state.guaranteed_pairs}×{self.cfg.kill_pnl_per_pair} "
-                        f"(= { -ws_state.guaranteed_pairs * self.cfg.kill_pnl_per_pair:.2f})"
-                    )
-                if kill_reason:
+                if ws_state.guaranteed_pnl < -ws_state.guaranteed_pairs * self.cfg.kill_pnl_per_pair:
                     logger.info(
-                        "[%s] Kill-switch: %s → stop adding, cancelling…",
-                        market.slug, kill_reason)
+                        "[%s] Kill-switch: guaranteed_pnl %.2f < "
+                        "-%d×%.2f (= %.2f) → stop adding, cancelling…",
+                        market.slug,
+                        ws_state.guaranteed_pnl,
+                        ws_state.guaranteed_pairs,
+                        self.cfg.kill_pnl_per_pair,
+                        -ws_state.guaranteed_pairs * self.cfg.kill_pnl_per_pair,
+                    )
                     await self.executor.cancel_all(ws_state.pending_orders)
                     ws_state.pending_orders.clear()
                     await asyncio.sleep(max(0.0, window_end - time.time() - 1))
@@ -710,8 +705,10 @@ class TradingEngine:
 
         Skips the tick if:
           - No fresh price data (WS data > 30s old)
-          - Spread on either side exceeds max_spread (thin market)
           - Up + Down deviates from 1.0 beyond max_price_dev
+
+        Note: spread is NOT checked — post-only limit orders are valid
+        regardless of market spread.
 
         Returns (up_price, down_price) or (None, None) to skip.
         """
@@ -730,14 +727,6 @@ class TradingEngine:
         if not up_snap.best_bid or not up_snap.best_ask:
             return None, None
         if not down_snap.best_bid or not down_snap.best_ask:
-            return None, None
-
-        # Skip if spread too wide (thin market — no point placing maker orders)
-        if up_snap.spread > self.cfg.max_spread:
-            logger.info("[%s] Up spread %.4f too wide → skip", slug, up_snap.spread)
-            return None, None
-        if down_snap.spread > self.cfg.max_spread:
-            logger.info("[%s] Down spread %.4f too wide → skip", slug, down_snap.spread)
             return None, None
 
         # Skip if either side is already settled (best_bid > threshold)
