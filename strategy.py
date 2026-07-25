@@ -99,15 +99,37 @@ class TemporalArbStrategy:
 
             pair_side = "Up" if lot.side == "Down" else "Down"
 
-            # Side taken by existing pending order?
+            # Side taken — if it's a cheap order, cancel and replace.
+            # If it's another pairing order, skip.
+            cancel_cheap_oid: str | None = None
             if pair_side == "Up" and pending_up:
-                logger.info("  [pairer] skip lot %s: %s side taken by pending order",
-                            lot.lot_id, pair_side)
-                continue
+                cancel_cheap_oid = next(
+                    (oid for oid, po in ws.pending_orders.items()
+                     if po.side == "Up" and po.cancelled_at == 0
+                     and po.pairing_lot_id is None),
+                    None,
+                )
+                if cancel_cheap_oid:
+                    logger.info("  [pairer] overriding cheap %s order %s for lot %s",
+                                pair_side, cancel_cheap_oid, lot.lot_id)
+                else:
+                    logger.info("  [pairer] skip lot %s: %s side taken by pairing order",
+                                lot.lot_id, pair_side)
+                    continue
             if pair_side == "Down" and pending_down:
-                logger.info("  [pairer] skip lot %s: %s side taken by pending order",
-                            lot.lot_id, pair_side)
-                continue
+                cancel_cheap_oid = next(
+                    (oid for oid, po in ws.pending_orders.items()
+                     if po.side == "Down" and po.cancelled_at == 0
+                     and po.pairing_lot_id is None),
+                    None,
+                )
+                if cancel_cheap_oid:
+                    logger.info("  [pairer] overriding cheap %s order %s for lot %s",
+                                pair_side, cancel_cheap_oid, lot.lot_id)
+                else:
+                    logger.info("  [pairer] skip lot %s: %s side taken by pairing order",
+                                lot.lot_id, pair_side)
+                    continue
 
             # max_per_side check
             if pair_side == "Up" and inv_up >= max_side:
@@ -154,6 +176,7 @@ class TemporalArbStrategy:
                 price=price,
                 role="pairing",
                 lot_id=lot.lot_id,
+                cancel_order_id=cancel_cheap_oid,
             ))
 
             # Claim the side so cheap-seeker doesn't collide

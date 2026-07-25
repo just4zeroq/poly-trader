@@ -678,6 +678,11 @@ class TradingEngine:
                     roles=roles,
                 ))
 
+            # Process cancellations first (pairer overriding cheap orders)
+            for d in decisions:
+                if d.cancel_order_id:
+                    await self.executor.cancel(d.cancel_order_id)
+
             for d in decisions:
                 token_id = market.up_token_id if d.side == "Up" else market.down_token_id
                 await self._place_order(

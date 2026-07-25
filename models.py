@@ -134,6 +134,7 @@ class Decision:
     price: float         # maker limit price (role-specific aggressiveness applied)
     role: str            # "cheap" / "pairing"
     lot_id: str | None = None  # pairing role: the lot being paired; cheap role: None
+    cancel_order_id: str | None = None  # pairer: cancel this cheap order before placing
 
 
 @dataclass
