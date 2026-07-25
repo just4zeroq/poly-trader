@@ -16,10 +16,13 @@ Conflict: pairer > cheap-seeker.
 """
 
 from __future__ import annotations
+import logging
 from typing import Optional
 
 from .config import Config
 from .models import Decision, OrderBookSnapshot, WindowState
+
+logger = logging.getLogger(__name__)
 
 
 class TemporalArbStrategy:
@@ -98,8 +101,12 @@ class TemporalArbStrategy:
 
             # Side taken by existing pending order?
             if pair_side == "Up" and pending_up:
+                logger.info("  [pairer] skip lot %s: %s side taken by pending order",
+                            lot.lot_id, pair_side)
                 continue
             if pair_side == "Down" and pending_down:
+                logger.info("  [pairer] skip lot %s: %s side taken by pending order",
+                            lot.lot_id, pair_side)
                 continue
 
             # max_per_side check
@@ -123,6 +130,12 @@ class TemporalArbStrategy:
 
             # Price must be within the book
             if price < snap.best_bid or price > snap.best_ask:
+                logger.info(
+                    "  [pairer] price %.4f outside book (bid=%.4f ask=%.4f) "
+                    "for lot %s @ %.4f — skip",
+                    price, snap.best_bid, snap.best_ask,
+                    lot.lot_id, lot.price,
+                )
                 continue
 
             # Pair qty logic: if the lot is small (< 2× per_tick), pair at
@@ -131,6 +144,8 @@ class TemporalArbStrategy:
             raw_qty = per_tick if lot.unpaired_qty < 2 * per_tick else lot.unpaired_qty
             qty = min(raw_qty, max_side - (inv_up if pair_side == "Up" else inv_down))
             if qty < self.cfg.min_order_size:
+                logger.info("  [pairer] qty %d < min %d for lot %s — skip",
+                            qty, self.cfg.min_order_size, lot.lot_id)
                 continue
 
             decisions.append(Decision(

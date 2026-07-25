@@ -718,6 +718,7 @@ class TradingEngine:
 
         # Must have fresh data for both sides
         if not up_snap or not down_snap:
+            logger.info("[%s] OrderBook snap missing → skip", slug)
             return None, None
         if (now - up_snap.updated_at) > 30 or (now - down_snap.updated_at) > 30:
             logger.info("[%s] Price data stale → skip", slug)
@@ -725,8 +726,12 @@ class TradingEngine:
 
         # Must have both bid and ask
         if not up_snap.best_bid or not up_snap.best_ask:
+            logger.info("[%s] Up no bid/ask (%.4f/%.4f) → skip",
+                        slug, up_snap.best_bid or 0, up_snap.best_ask or 0)
             return None, None
         if not down_snap.best_bid or not down_snap.best_ask:
+            logger.info("[%s] Down no bid/ask (%.4f/%.4f) → skip",
+                        slug, down_snap.best_bid or 0, down_snap.best_ask or 0)
             return None, None
 
         # Skip if either side is already settled (best_bid > threshold)
