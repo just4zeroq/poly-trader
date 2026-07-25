@@ -208,24 +208,11 @@ class TemporalArbStrategy:
                         # Clamp: post-only BUY must not cross best_ask
                         if price >= snap.best_ask:
                             price = snap.best_bid
-                        # Guard 4: match price against existing unpaired opposite-side lots.
-                        # Sort by price descending (most expensive first), try each.
-                        # Skip if none can pair profitably.
-                        opposite_side = "Down" if cheap == "Up" else "Up"
-                        unpaired_opp = [
-                            l for l in ws.lots
-                            if l.side == opposite_side and l.unpaired_qty > 0
-                        ]
-                        if unpaired_opp:
-                            unpaired_opp.sort(key=lambda l: l.price, reverse=True)
-                            can_pair = any(
-                                price + lot.price <= self.cfg.max_pair_cost
-                                for lot in unpaired_opp
-                            )
-                            if not can_pair:
-                                return decisions
 
                         qty = min(per_tick, max_side - (inv_up if cheap == "Up" else inv_down))
+
+                        # Auto-pair key links cheap + expensive sides for paired fill
+                        pair_key = f"ap_{ws.window_num}_{len(decisions)}"
 
                         decisions.append(Decision(
                             side=cheap,
@@ -233,6 +220,30 @@ class TemporalArbStrategy:
                             price=price,
                             role="cheap",
                             lot_id=None,
+                            auto_pair_key=pair_key,
                         ))
+
+                        # Plan 2: also buy the expensive side at pairing_aggressiveness
+                        # (no max_pair_cost cap — both orders on book simultaneously)
+                        expensive = "Down" if cheap == "Up" else "Up"
+                        # Check if side was claimed by pairer after cheap decision
+                        exp_claimed = (expensive == "Up" and pending_up) or (expensive == "Down" and pending_down)
+                        if not exp_claimed:
+                            exp_snap = up_snap if expensive == "Up" else down_snap
+                            if exp_snap.best_bid and exp_snap.best_ask:
+                                exp_price = round(
+                                    exp_snap.best_bid + exp_snap.spread * self.cfg.pairing_aggressiveness,
+                                    4,
+                                )
+                                if exp_price >= exp_snap.best_ask:
+                                    exp_price = exp_snap.best_bid
+                                decisions.append(Decision(
+                                    side=expensive,
+                                    amount=qty,
+                                    price=exp_price,
+                                    role="auto_pair",
+                                    lot_id=None,
+                                    auto_pair_key=pair_key,
+                                ))
 
         return decisions

@@ -688,6 +688,7 @@ class TradingEngine:
                 await self._place_order(
                     market.slug, token_id, d.side, d.price, d.amount,
                     pairing_lot_id=d.lot_id,
+                    auto_pair_key=d.auto_pair_key,
                 )
 
             if ws_state.is_full(self.cfg.max_per_side):
@@ -822,10 +823,12 @@ class TradingEngine:
 
     async def _place_order(self, slug: str, token_id: str, outcome: str,
                            price: float, amount: int,
-                           pairing_lot_id: str | None = None):
+                           pairing_lot_id: str | None = None,
+                           auto_pair_key: str | None = None):
         await self.executor.place(
             slug, token_id, outcome, price, amount,
             pairing_lot_id=pairing_lot_id,
+            auto_pair_key=auto_pair_key,
         )
 
     # ── Settlement ──

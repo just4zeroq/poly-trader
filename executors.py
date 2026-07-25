@@ -87,6 +87,22 @@ class OrderExecutor:
         )
         ws.lots.append(lot)
 
+        # Auto-pair: match fills from the same auto_pair_key on opposite sides
+        if po.auto_pair_key:
+            opp_side = "Down" if po.side == "Up" else "Up"
+            for existing in ws.lots:
+                if (existing is not lot
+                        and existing.side == opp_side
+                        and existing.auto_pair_key == po.auto_pair_key
+                        and existing.unpaired_qty > 0):
+                    capped = min(fill_size, existing.amount - existing.paired_qty)
+                    existing.paired_qty += capped
+                    lot.paired_qty += capped
+                    break
+            else:
+                # No matching lot yet — store key so the other side finds us
+                lot.auto_pair_key = po.auto_pair_key
+
         # If this was a pairing order, mark the paired lot AND mirror the
         # paired_qty on the fill-side lot so both sides reflect the truth.
         # Cap at lot.amount to guard against race: a cancelled pairing order's
@@ -106,7 +122,8 @@ class LiveExecutor(OrderExecutor):
 
     async def place(self, slug: str, token_id: str, outcome: str,
                     price: float, amount: int,
-                    pairing_lot_id: str | None = None) -> Optional[str]:
+                    pairing_lot_id: str | None = None,
+                    auto_pair_key: str | None = None) -> Optional[str]:
         ws = self.engine._windows.get(slug)
         if ws is None:
             return None
@@ -136,6 +153,7 @@ class LiveExecutor(OrderExecutor):
                 price=price, amount=amount,
                 placed_at=time.time(),
                 pairing_lot_id=pairing_lot_id,
+                auto_pair_key=auto_pair_key,
             )
             await self.engine._emit("order_placed", OrderPlaced(
                 window_num=ws.window_num,
