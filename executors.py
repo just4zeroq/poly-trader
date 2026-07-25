@@ -10,10 +10,13 @@ window the order belongs to. cancel() searches across all active windows.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import TYPE_CHECKING, Optional
 
 from polymarket.models.clob.user_events import UserTradeEvent
+
+logger = logging.getLogger(__name__)
 
 from .models import (
     Lot,
@@ -58,7 +61,24 @@ class OrderExecutor:
 
     def _create_lot_and_pair(self, ws: WindowState, po: PendingOrder,
                               fill_size: int, fill_price: float):
-        """Create a Lot for this fill and update paired lot if pairing."""
+        """Create/merge a Lot for this fill and update paired lot if pairing.
+
+        Merges fills from the same non-pairing order at the same price into
+        one lot, so small partial fills (e.g. 2+2+2) don't create tiny lots
+        below min_order_size that the pairer can't work with.
+        """
+        # Non-pairing fill: try to merge into an existing lot at the same
+        # side + price (same order, same cost basis).
+        if not po.pairing_lot_id:
+            for existing in ws.lots:
+                if (existing.side == po.side
+                        and existing.price == fill_price
+                        and existing.unpaired_qty > 0):
+                    existing.amount += fill_size
+                    # If this lot already has a paired mirror, extend it too
+                    return
+
+        # New lot (or pairing fill, which always creates a new lot)
         lot_id = f"lot_{ws.window_num}_{po.side}_{len(ws.lots)}"
         lot = Lot(
             lot_id=lot_id, side=po.side,
@@ -198,18 +218,30 @@ class LiveExecutor(OrderExecutor):
                 po = ws.pending_orders.get(oid)
                 if po is None:
                     continue
-                po.filled += fill_size
-                ws.inventory[po.side] += fill_size
-                ws.cost[po.side] += fill_size * fill_price
-                ws.total_spent += fill_size * fill_price
+
+                # Cap fill to remaining to prevent overfill (Polymarket
+                # sometimes reports more fill than the order amount).
+                actual = min(fill_size, po.remaining)
+                if actual <= 0:
+                    continue
+                if actual < fill_size:
+                    logger.warning(
+                        "Overfill capped: fill=%d > remaining=%d for %s",
+                        fill_size, po.remaining, oid,
+                    )
+
+                po.filled += actual
+                ws.inventory[po.side] += actual
+                ws.cost[po.side] += actual * fill_price
+                ws.total_spent += actual * fill_price
                 ws.trades += 1
 
                 # Create lot and handle pairing
-                self._create_lot_and_pair(ws, po, fill_size, fill_price)
+                self._create_lot_and_pair(ws, po, actual, fill_price)
 
                 await self.engine._emit("order_filled", OrderFilled(
                     window_num=ws.window_num,
-                    outcome=po.side, price=fill_price, amount=fill_size,
+                    outcome=po.side, price=fill_price, amount=actual,
                     order_id=oid,
                     total_inv_up=ws.inventory["Up"],
                     total_inv_down=ws.inventory["Down"],
