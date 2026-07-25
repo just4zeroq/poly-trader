@@ -125,9 +125,11 @@ class TemporalArbStrategy:
             if price < snap.best_bid or price > snap.best_ask:
                 continue
 
-            # Pair at per_tick — the lot is a price anchor only, not a qty limit.
-            # Overfill beyond per_tick is handled by the exchange.
-            qty = min(per_tick, max_side - (inv_up if pair_side == "Up" else inv_down))
+            # Pair qty logic: if the lot is small (< 2× per_tick), pair at
+            # per_tick so the exchange has room to fill.  Otherwise pair the
+            # full unpaired amount to close exposure quickly.
+            raw_qty = per_tick if lot.unpaired_qty < 2 * per_tick else lot.unpaired_qty
+            qty = min(raw_qty, max_side - (inv_up if pair_side == "Up" else inv_down))
             if qty < self.cfg.min_order_size:
                 continue
 
