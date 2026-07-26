@@ -2,51 +2,81 @@
 
 ## Project Overview
 
-WebSocket-based market making bot trading Polymarket BTC 15m binary options (Up/Down). Strategy: buy both sides equally at maker prices each tick, profit when average pair cost < $1.0.
+WebSocket-based market making bot trading Polymarket BTC 15m binary options (Up/Down). Strategy: independently buy Up and Down at maker prices each tick. Fills are generically paired. Profit when average pair cost < $1.0.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `main.py` | CLI entry: `info`, `paper`, `run`, `check` |
+| `main.py` | CLI entry: `info`, `run`, `check` |
 | `config.py` | All config from `.env` (`POLY_*` / `POLYMARKET_*`) |
 | `client.py` | SDK wrapper — market discovery, WS subscribe, order placement |
 | `engine.py` | Core engine — WS lifecycle, tick loop, settlement |
-| `executors.py` | `PaperExecutor` (simulated fills) / `LiveExecutor` (real orders + user WS fills) |
-| `strategy.py` | Pure allocation logic — equal sizing per tick |
+| `executors.py` | `LiveExecutor` — real Polymarket orders + user WS fill tracking |
+| `strategy.py` | Maker strategy — independent Up/Down buys, per-side exposure cap, generic pairing |
+| `tail_sweep.py` | Tail-end sweep strategy — last 3 min, buys winner at market + loser with 5¢ profit |
 | `models.py` | Data models — `MarketInfo`, `WindowState`, `OrderBookSnapshot`, `PendingOrder` |
 
 ## CLI Commands
 
 ```bash
 python -m poly_trader info                               # query current market
-python -m poly_trader paper --market btc-updown-15m       # paper test
-python -m poly_trader run --market btc-updown-15m         # live trading
+python -m poly_trader run --market btc-updown-15m         # live trading (maker strategy)
+python -m poly_trader.tail_sweep --market btc-updown-15m  # standalone tail-end sweep
 python -m poly_trader check                               # verify credentials
-python -m poly_trader.check_balance                       # check USDC balance
 ```
 
 ## Architecture
 
 - **Multi-market capable**: One loop per `MarketSpec`, sharing WS connection + PriceCache
 - **Event-driven**: Typed dataclass events (`OrderFilled`, `TickEvent`, `WindowEnd`, etc.)
-- **Pluggable executors**: `PaperExecutor` (time-based probabilistic fills) vs `LiveExecutor` (real Polymarket orders)
+- **Pluggable executors**: `LiveExecutor` — real Polymarket orders via CLOB REST API + WS user channel for fill tracking
 - **WS subscriptions**: Public market data (BestBidAsk, trades) + optional authenticated user channel (fills)
+
+## Strategies
+
+### Maker Strategy (`strategy.py`)
+Continuous market-making: independently buy Up and Down each tick at maker prices. Fills are generically paired. Profit when average pair cost < $1.0. Supports coupled pricing mode (`POLY_PROFIT_TARGET > 0`) where each new pair costs `1.0 - profit_target`.
+
+```bash
+python -m poly_trader run --market btc-updown-15m
+```
+
+### Tail-End Sweep (`tail_sweep.py`)
+Standalone strategy for the last 3 minutes of a window. When one side's best_bid reaches >= 0.90 (market clearly resolved), it buys the winner at market price and the loser at a price that locks in 5¢ profit per pair. Runs independently, does not interfere with the maker strategy.
+
+```bash
+python -m poly_trader.tail_sweep --market btc-updown-15m
+```
+
+Options: `--per-tick N` `--max-side N` `-v` (verbose logging)
 
 ## Key Parameters (`.env`)
 
-- `POLY_PER_TICK` — contracts per tick per side (default: 5)
-- `POLY_MAX_PER_SIDE` — max position per side (default: 500)
-- `POLY_AGGRESSIVENESS` — 0-1, maker price = bid + spread × aggressiveness (default: 0.3)
-- `POLY_MAX_PAIR_COST` — stop adding if avg pair cost > this (default: 0.9999)
-- `POLY_MAX_DRAWDOWN` — session PnL stop (default: -10.0)
-- `POLY_STOP_ON_WINDOW_LOSS` — skip next window after loss (default: true)
-- `POLY_CANCEL_MIN_AGE` — minimum seconds before a pending order can be cancelled (default: 30.0)
-- `POLY_MIN_REMAINING_TIME` — stop new orders when < this many seconds left in window (default: 300.0)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POLY_PER_TICK` | 5 | Contracts per tick per side |
+| `POLY_MAX_PER_SIDE` | 500 | Max exposure per side (filled + pending shares) |
+| `POLY_AGGRESSIVENESS` | 0.3 | Maker price = bid + spread × aggressiveness (0-1) |
+| `POLY_MAX_PAIR_SUM` | 0.98 | Skip tick if up_price + down_price ≥ this |
+| `POLY_MIN_PRICE_GAP` | 0.02 | Min price gap to place another order on same side (avoids stacking) |
+| `POLY_CANCEL_MIN_AGE` | 30.0 | Min seconds before pending order can be cancelled |
+| `POLY_CANCEL_REPLACE_THRESHOLD` | 0.10 | Fractional price deviation to trigger cancel-replace |
+| `POLY_MIN_REMAINING_TIME` | 180.0 | Stop new orders when < this many seconds left in window |
+| `POLY_MIN_ORDER_SIZE` | 5 | Minimum order size in contracts |
+| `POLY_KILL_PNL_PER_PAIR` | 0.03 | Per-pair loss threshold for kill-switch |
+| `POLY_MAX_IMBALANCE` | 100 | Stop adding to heavy side when filled+pending difference exceeds this |
+| `POLY_MAX_DRAWDOWN` | -10.0 | Session PnL stop (USDC) |
+| `POLY_STOP_ON_WINDOW_LOSS` | true | Skip next window after loss |
+| `POLY_MAX_PRICE_DEV` | 0.20 | Max deviation from 1.0 for pair sum validation |
+| `POLY_MAX_EXTREME_PRICE` | 0.90 | Skip tick if either side's best_bid exceeds this |
+| `POLY_MAX_CONSECUTIVE_FAILURES` | 15 | Stop placing after N consecutive rejected ticks (balance likely depleted) |
+| `POLY_MIN_TICK_INTERVAL` | 1.0 | Min seconds between ticks |
+| `POLY_WS_RECONNECT_DELAY` | 3.0 | WS reconnect delay on disconnect |
 
-## Live vs Paper Mode
+## Live Mode
 
-Paper mode uses probabilistic fills based on order age + random chance, triggered by WS trade events (`on_trade`) and a periodic fallback (`try_fill_pending`). Live mode places real `post_only` limit orders via the Polymarket SDK and tracks fills via the authenticated user WS channel (`UserTradeEvent` → `handle_user_event`).
+Orders are placed as `post_only` limit orders via the Polymarket CLOB SDK. Fill tracking uses the authenticated user WebSocket channel (`UserTradeEvent` → `handle_user_event`). Each fill creates a `Lot` and pairs generically with any unpaired opposite-side lot via `_create_lot_and_pair()`.
 
 ## Credential Resolution
 
@@ -59,7 +89,6 @@ Config reads `POLY_*` first, falls back to `POLYMARKET_*` aliases for credential
 ## Scripts
 
 ```bash
-./run_paper.sh    # paper test launcher
 ./run_live.sh     # live trading (with credential + 5s safety delay)
 ./check.sh        # credential + balance check
 ```

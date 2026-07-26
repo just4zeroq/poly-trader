@@ -39,8 +39,7 @@ class OrderExecutor:
         self.engine: TradingEngine | None = None
 
     async def place(self, slug: str, token_id: str, outcome: str,
-                    price: float, amount: int,
-                    pairing_lot_id: str | None = None) -> Optional[str]:
+                    price: float, amount: int) -> Optional[str]:
         raise NotImplementedError
 
     async def cancel(self, order_id: str) -> bool:
@@ -61,24 +60,7 @@ class OrderExecutor:
 
     def _create_lot_and_pair(self, ws: WindowState, po: PendingOrder,
                               fill_size: int, fill_price: float):
-        """Create/merge a Lot for this fill and update paired lot if pairing.
-
-        Merges fills from the same non-pairing order at the same price into
-        one lot, so small partial fills (e.g. 2+2+2) don't create tiny lots
-        below min_order_size that the pairer can't work with.
-        """
-        # Non-pairing fill: try to merge into an existing lot at the same
-        # side + price (same order, same cost basis).
-        if not po.pairing_lot_id:
-            for existing in ws.lots:
-                if (existing.side == po.side
-                        and existing.price == fill_price
-                        and existing.unpaired_qty > 0):
-                    existing.amount += fill_size
-                    # If this lot already has a paired mirror, extend it too
-                    return
-
-        # New lot (or pairing fill, which always creates a new lot)
+        """Create a Lot for this fill and pair with any unpaired opposite-side lot."""
         lot_id = f"lot_{ws.window_num}_{po.side}_{len(ws.lots)}"
         lot = Lot(
             lot_id=lot_id, side=po.side,
@@ -87,61 +69,64 @@ class OrderExecutor:
         )
         ws.lots.append(lot)
 
-        # Auto-pair: match fills from the same auto_pair_key on opposite sides
-        if po.auto_pair_key:
-            opp_side = "Down" if po.side == "Up" else "Up"
-            for existing in ws.lots:
-                if (existing is not lot
-                        and existing.side == opp_side
-                        and existing.auto_pair_key == po.auto_pair_key
-                        and existing.unpaired_qty > 0):
-                    capped = min(fill_size, existing.amount - existing.paired_qty)
-                    existing.paired_qty += capped
-                    lot.paired_qty += capped
-                    break
-            else:
-                # No matching lot yet — store key so the other side finds us
-                lot.auto_pair_key = po.auto_pair_key
+        # Generic pairing: find any unpaired opposite-side lot
+        opp_side = "Down" if po.side == "Up" else "Up"
+        paired_with = None
+        for existing in ws.lots:
+            if (existing is not lot
+                    and existing.side == opp_side
+                    and existing.unpaired_qty > 0):
+                capped = min(fill_size, existing.unpaired_qty)
+                existing.paired_qty += capped
+                lot.paired_qty += capped
+                paired_with = existing.lot_id
+                break
 
-        # If this was a pairing order, mark the paired lot AND mirror the
-        # paired_qty on the fill-side lot so both sides reflect the truth.
-        # Cap at lot.amount to guard against race: a cancelled pairing order's
-        # in-flight fill and a replacement pairing order both incrementing the
-        # same lot's paired_qty (see review bug #1).
-        if po.pairing_lot_id:
-            for existing in ws.lots:
-                if existing.lot_id == po.pairing_lot_id:
-                    capped = min(fill_size, existing.amount - existing.paired_qty)
-                    existing.paired_qty += capped
-                    lot.paired_qty += capped  # mirror on the fill lot
-                    break
+        if paired_with:
+            logger.info(
+                "  [pair] %s lot=%s paired %d/%d with %s  "
+                "unpaired remaining: Up=%d Down=%d",
+                po.side, lot_id, lot.paired_qty, lot.amount,
+                paired_with,
+                sum(l.unpaired_qty for l in ws.lots if l.side == "Up"),
+                sum(l.unpaired_qty for l in ws.lots if l.side == "Down"),
+            )
+        else:
+            logger.info(
+                "  [pair] %s lot=%s (%d @ %.4f) UNPAIRED — no opposite-side open lot  "
+                "unpaired: Up=%d Down=%d",
+                po.side, lot_id, fill_size, fill_price,
+                sum(l.unpaired_qty for l in ws.lots if l.side == "Up"),
+                sum(l.unpaired_qty for l in ws.lots if l.side == "Down"),
+            )
 
 
 class LiveExecutor(OrderExecutor):
     """Live trading — SDK place_limit_order + cancel_order."""
 
+    def __init__(self):
+        super().__init__()
+        # Orphan fill buffer: fills that arrived before pending_orders entry
+        self._orphan_fills: dict[str, tuple] = {}
+        # Dedup set: skip historical fill replay on User WS reconnect
+        self._fill_seen: set[str] = set()
+
     async def place(self, slug: str, token_id: str, outcome: str,
-                    price: float, amount: int,
-                    pairing_lot_id: str | None = None,
-                    auto_pair_key: str | None = None) -> Optional[str]:
+                    price: float, amount: int) -> Optional[str]:
         ws = self.engine._windows.get(slug)
         if ws is None:
             return None
-        # Enforce one pending order per side per *role*.
-        # Pairing orders (pairing_lot_id is not None) have priority: they can
-        # coexist alongside a cheap order on the same side.  Cheap orders are
-        # blocked by any existing order (cheap or pairing) on the same side.
-        if pairing_lot_id is not None:
-            # Pairing — only block if another pairing order exists on this side
-            if any(po.side == outcome and po.cancelled_at == 0
-                   and po.pairing_lot_id is not None
-                   for po in ws.pending_orders.values()):
-                return None
-        else:
-            # Cheap — blocked by any pending order on this side
-            if any(po.side == outcome and po.cancelled_at == 0
-                   for po in ws.pending_orders.values()):
-                return None
+
+        # Count current pending for this side (anomaly detection)
+        side_pending = sum(1 for po in ws.pending_orders.values()
+                          if po.side == outcome and po.cancelled_at == 0)
+        logger.info(
+            "  [place] %s %d @ %.4f  side_pending=%d  inv=(U=%d/D=%d)",
+            outcome, amount, price,
+            side_pending,
+            ws.inventory["Up"], ws.inventory["Down"],
+        )
+
         oid = await self.engine.sdk.place_limit_order(
             token_id=token_id, side="BUY",
             price=price, size=amount,
@@ -152,8 +137,6 @@ class LiveExecutor(OrderExecutor):
                 side=outcome, buy_sell="BUY",
                 price=price, amount=amount,
                 placed_at=time.time(),
-                pairing_lot_id=pairing_lot_id,
-                auto_pair_key=auto_pair_key,
             )
             await self.engine._emit("order_placed", OrderPlaced(
                 window_num=ws.window_num,
@@ -161,6 +144,27 @@ class LiveExecutor(OrderExecutor):
                 price=price, amount=amount,
                 order_id=oid,
             ))
+
+            # Check if a fill for this order arrived before we registered it
+            orphan = self._orphan_fills.pop(oid, None)
+            if orphan:
+                logger.info("  [place] Processing orphan fill for %s…", oid[:12])
+                ws2 = self.engine._windows.get(slug)
+                if ws2:
+                    po2 = ws2.pending_orders.get(oid)
+                    if po2:
+                        fill_size, fill_price, _ = orphan
+                        self._process_fill(ws2, po2, fill_size, fill_price)
+                        await self.engine._emit("order_filled", OrderFilled(
+                            window_num=ws2.window_num,
+                            outcome=outcome, price=fill_price, amount=fill_size,
+                            order_id=oid,
+                            total_inv_up=ws2.inventory["Up"],
+                            total_inv_down=ws2.inventory["Down"],
+                        ))
+                        if po2.remaining <= 0:
+                            del ws2.pending_orders[oid]
+
             return oid
 
         await self.engine._emit("order_failed", OrderFailed(
@@ -193,10 +197,13 @@ class LiveExecutor(OrderExecutor):
                     price=po.price, order_id=order_id,
                 ))
                 return True
+        logger.warning("  [cancel] SDK cancel_order(%s…) FAILED", order_id[:12])
         return ok
 
     async def cancel_all(self, pending_orders: dict[str, PendingOrder]):
         """Soft-cancel all pending orders, wait for in-flight fills, then flush."""
+        if pending_orders:
+            logger.info("  [cancel_all] Cancelling %d orders…", len(pending_orders))
         for oid in list(pending_orders):
             await self.cancel(oid)
         # Give in-flight fills time to arrive via UserTradeEvent
@@ -216,13 +223,48 @@ class LiveExecutor(OrderExecutor):
                 if po.cancelled_at > 0 and now - po.cancelled_at > grace:
                     del ws.pending_orders[oid]
 
+    def _process_fill(self, ws: WindowState, po: PendingOrder,
+                      fill_size: int, fill_price: float):
+        """Apply a fill to a pending order (shared by _handle_trade and orphan replay)."""
+        actual = min(fill_size, po.remaining)
+        if actual <= 0:
+            return
+        if actual < fill_size:
+            logger.warning(
+                "  [fill] Overfill capped: fill=%d > remaining=%d for %s…",
+                fill_size, po.remaining, po.order_id[:12],
+            )
+
+        po.filled += actual
+        ws.inventory[po.side] += actual
+        ws.cost[po.side] += actual * fill_price
+        ws.total_spent += actual * fill_price
+        ws.trades += 1
+
+        self._create_lot_and_pair(ws, po, actual, fill_price)
+
+        remaining = po.amount - po.filled
+        logger.info(
+            "  [fill] %s %d @ %.4f  order=%s…  "
+            "inv=(U=%d/D=%d) remaining=%d",
+            po.side, actual, fill_price, po.order_id[:12],
+            ws.inventory["Up"], ws.inventory["Down"],
+            remaining,
+        )
+
     async def handle_user_event(self, event):
         """Process authenticated user channel events for fill tracking."""
         if isinstance(event, UserTradeEvent):
             await self._handle_trade(event.payload)
 
     async def _handle_trade(self, payload):
-        """Match a UserTradeEvent against our pending orders."""
+        """Match a UserTradeEvent against our pending orders.
+
+        Handles three edge cases:
+          1. Historical fill replay on reconnect → dedup via _fill_seen
+          2. Fill arrives before pending_orders entry → orphan buffer
+          3. Unknown order (previous instance) → warning
+        """
         if not payload.maker_orders:
             return
         for mo in payload.maker_orders:
@@ -231,35 +273,27 @@ class LiveExecutor(OrderExecutor):
             fill_price = float(mo.price)
             if fill_size <= 0:
                 continue
+
+            # Dedup: skip historical replay from User WS reconnect
+            if oid in self._fill_seen:
+                continue
+            self._fill_seen.add(oid)
+            if len(self._fill_seen) > 2000:
+                self._fill_seen.clear()
+
             # Locate the pending order across all active windows
+            found = False
             for ws in self.engine._windows.values():
                 po = ws.pending_orders.get(oid)
                 if po is None:
                     continue
+                found = True
 
-                # Cap fill to remaining to prevent overfill (Polymarket
-                # sometimes reports more fill than the order amount).
-                actual = min(fill_size, po.remaining)
-                if actual <= 0:
-                    continue
-                if actual < fill_size:
-                    logger.warning(
-                        "Overfill capped: fill=%d > remaining=%d for %s",
-                        fill_size, po.remaining, oid,
-                    )
-
-                po.filled += actual
-                ws.inventory[po.side] += actual
-                ws.cost[po.side] += actual * fill_price
-                ws.total_spent += actual * fill_price
-                ws.trades += 1
-
-                # Create lot and handle pairing
-                self._create_lot_and_pair(ws, po, actual, fill_price)
+                self._process_fill(ws, po, fill_size, fill_price)
 
                 await self.engine._emit("order_filled", OrderFilled(
                     window_num=ws.window_num,
-                    outcome=po.side, price=fill_price, amount=actual,
+                    outcome=po.side, price=fill_price, amount=fill_size,
                     order_id=oid,
                     total_inv_up=ws.inventory["Up"],
                     total_inv_down=ws.inventory["Down"],
@@ -267,3 +301,20 @@ class LiveExecutor(OrderExecutor):
                 if po.remaining <= 0:
                     del ws.pending_orders[oid]
                 break  # found the order — stop scanning windows, next maker_order
+
+            if not found:
+                # Could be a race: fill arrived before place() registered the order.
+                # Store in orphan buffer; place() will check after registering.
+                self._orphan_fills[oid] = (fill_size, fill_price, time.time())
+                # Prune orphan buffer (stale entries > 60s)
+                now = time.time()
+                stale = [k for k, v in self._orphan_fills.items() if now - v[2] > 60]
+                for k in stale:
+                    del self._orphan_fills[k]
+                # Only warn if not in orphan buffer already (first time)
+                if len(self._orphan_fills) <= 50:
+                    logger.warning(
+                        "  [fill] UNMATCHED fill for unknown order=%s… "
+                        "size=%d price=%.4f  (buffered as orphan)",
+                        oid[:12], fill_size, fill_price,
+                    )

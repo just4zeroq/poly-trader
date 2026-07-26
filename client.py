@@ -28,7 +28,7 @@ from polymarket.streams._specs import MarketSpec as SdkMarketSpec
 from polymarket.streams._specs import UserSpec
 
 from .config import Config
-from .models import MarketInfo, MarketSpec
+from .models import MarketInfo, MarketSpec, PendingOrder
 
 logger = logging.getLogger(__name__)
 
@@ -279,6 +279,91 @@ class SdkClient:
 
     # ── Order execution ──
 
+    async def load_current_state(self, market: MarketInfo) -> Optional[dict]:
+        """Load current positions + open orders for a market from the CLOB.
+
+        Called at engine startup to restore WindowState mid-window so the
+        strategy doesn't re-buy what's already held.
+
+        Returns dict with::
+
+            inventory:  {"Up": int, "Down": int}
+            avg_cost:   {"Up": float, "Down": float}
+            pending:    dict[order_id, PendingOrder]
+            balance:    int  (raw USDC.e units, 1e6 = $1)
+
+        Returns None if secure client is unavailable or any API call fails.
+        """
+        if not self._secure:
+            return None
+
+        up_tid = market.up_token_id
+        down_tid = market.down_token_id
+        cid = market.condition_id
+
+        inventory: dict[str, int] = {"Up": 0, "Down": 0}
+        avg_cost: dict[str, float] = {"Up": 0.0, "Down": 0.0}
+        pending: dict[str, PendingOrder] = {}
+        balance = 0
+
+        try:
+            # ── 1. Open orders → pending_orders ──
+            paginator = self._secure.list_open_orders(market=cid)
+            async for page in paginator:
+                for order in page.items:
+                    oid = order.id
+                    tid = str(order.token_id)
+                    remaining = int(order.original_size - order.size_matched)
+                    if remaining <= 0:
+                        continue
+                    side = "Up" if tid == up_tid else ("Down" if tid == down_tid else None)
+                    if side is None:
+                        continue
+                    pending[oid] = PendingOrder(
+                        order_id=oid,
+                        token_id=tid,
+                        side=side,
+                        buy_sell="BUY",
+                        price=float(order.price),
+                        amount=int(order.original_size),
+                        filled=int(order.size_matched),
+                        placed_at=order.created_at.timestamp() if order.created_at else 0,
+                    )
+
+            # ── 2. Positions → inventory + avg_cost ──
+            pos_paginator = self._secure.list_positions(market=[cid])
+            async for page in pos_paginator:
+                for pos in page.items:
+                    if not pos.token_id:
+                        continue
+                    tid = str(pos.token_id)
+                    if tid not in (up_tid, down_tid):
+                        continue
+                    sz = int(pos.size) if pos.size else 0
+                    if sz <= 0:
+                        continue
+                    if tid == up_tid:
+                        inventory["Up"] = sz
+                        avg_cost["Up"] = float(pos.avg_price) if pos.avg_price else 0.0
+                    elif tid == down_tid:
+                        inventory["Down"] = sz
+                        avg_cost["Down"] = float(pos.avg_price) if pos.avg_price else 0.0
+
+            # ── 3. Wallet balance (raw USDC.e units, 1e6 = $1) ──
+            bal = await self._secure.get_balance_allowance(asset_type="COLLATERAL")
+            balance = bal.balance
+
+        except Exception as e:
+            logger.warning("load_current_state failed: %s", e)
+            return None
+
+        return {
+            "inventory": inventory,
+            "avg_cost": avg_cost,
+            "pending": pending,
+            "balance": balance,
+        }
+
     async def place_limit_order(
         self, token_id: str, side: str, price: float, size: int,
     ) -> Optional[str]:
@@ -290,7 +375,17 @@ class SdkClient:
             logger.error("Cannot place order: no secure client")
             return None
         tick_size = await self.get_tick_size(token_id)
+        price_raw = price
         price = self.round_to_tick(price, tick_size)
+        if price != price_raw:
+            logger.info(
+                "  [sdk] Price rounded from %.6f to %.6f (tick=%.4f) token=%s…",
+                price_raw, price, tick_size, token_id[:12],
+            )
+        logger.info(
+            "  [sdk] place_limit_order  token=%s… side=%s price=%.4f size=%d",
+            token_id[:12], side, price, size,
+        )
         try:
             result = await self._secure.place_limit_order(
                 token_id=token_id,
@@ -300,16 +395,25 @@ class SdkClient:
                 post_only=True,
             )
             if isinstance(result, AcceptedOrder):
+                logger.info(
+                    "  [sdk] Order ACCEPTED  id=%s…  token=%s… price=%.4f size=%d",
+                    result.order_id[:12], token_id[:12], price, size,
+                )
                 return result.order_id
             if isinstance(result, RejectedOrder):
-                logger.warning("Order REJECTED: code=%s msg=%s token=%s… side=%s price=%s size=%s",
-                               result.code, result.message, token_id[:12], side, price, size)
+                logger.warning(
+                    "  [sdk] Order REJECTED: code=%s msg=%s "
+                    "token=%s… side=%s price=%.4f size=%d",
+                    result.code, result.message,
+                    token_id[:12], side, price, size,
+                )
                 return None
             # Fallback for unexpected response types
-            logger.warning("Unexpected order response: %r", result)
+            logger.warning("  [sdk] Unexpected order response: %r", result)
             return None
         except Exception as e:
-            logger.warning("place_limit_order exception: %s", e)
+            logger.warning("  [sdk] place_limit_order exception: %s  token=%s… price=%.4f size=%d",
+                           e, token_id[:12], price, size)
             return None
 
     async def cancel_order(self, order_id: str) -> bool:
@@ -318,13 +422,62 @@ class SdkClient:
         Returns True if the cancel request was accepted by the CLOB (HTTP 2xx).
         """
         if not self._secure:
+            logger.warning("  [sdk] cancel_order(%s…) FAILED: no secure client", order_id[:12])
             return False
+        logger.info("  [sdk] cancel_order(%s…)", order_id[:12])
         try:
             await self._secure.cancel_order(order_id=order_id)
+            logger.info("  [sdk] cancel_order(%s…) OK", order_id[:12])
             return True
         except Exception as e:
-            logger.warning("cancel_order(%s…) failed: %s", order_id[:12], e)
+            logger.warning("  [sdk] cancel_order(%s…) failed: %s", order_id[:12], e)
             return False
+
+    async def cancel_all_open_orders(self, market: Optional[str] = None) -> int:
+        """Cancel open orders, optionally scoped to a market (condition ID).
+
+        When market is given, lists open orders for that market and cancels
+        each individually (safer for multi-bot setups).  Otherwise cancels
+        ALL orders on the CLOB (legacy behavior).
+
+        Returns the number of orders cancelled.
+        """
+        if not self._secure:
+            logger.warning("  [sdk] cancel_all_open_orders FAILED: no secure client")
+            return 0
+
+        if market:
+            return await self._cancel_by_market(market)
+
+        logger.info("  [sdk] cancel_all_open_orders…")
+        try:
+            resp = await self._secure.cancel_all()
+            cancelled = len(resp.canceled) if hasattr(resp, 'canceled') else 0
+            if cancelled > 0:
+                logger.warning("  [sdk] cancel_all: %d lingering orders cancelled", cancelled)
+            else:
+                logger.info("  [sdk] cancel_all: no lingering orders")
+            return int(cancelled)
+        except Exception as e:
+            logger.warning("  [sdk] cancel_all failed: %s", e)
+            return 0
+
+    async def _cancel_by_market(self, cid: str) -> int:
+        """Cancel only orders belonging to a specific market (condition ID)."""
+        cancelled = 0
+        try:
+            paginator = self._secure.list_open_orders(market=cid)
+            async for page in paginator:
+                for order in page.items:
+                    ok = await self.cancel_order(order.id)
+                    if ok:
+                        cancelled += 1
+            if cancelled > 0:
+                logger.info("  [sdk] cancelled %d orders for market %s", cancelled, cid[:12])
+            return cancelled
+        except Exception as e:
+            logger.warning("  [sdk] _cancel_by_market failed: %s", e)
+            return cancelled
 
     async def get_open_orders(self) -> list:
         """Fetch all open orders (uses the underlying public client's method)."""

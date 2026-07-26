@@ -116,7 +116,6 @@ class Lot:
     price: float      # fill price
     paired_qty: int = 0
     created_at: float = 0.0
-    auto_pair_key: str = ""  # matched key for auto_paired fills; empty = not auto-paired
 
     @property
     def unpaired_qty(self) -> int:
@@ -129,14 +128,10 @@ class Lot:
 
 @dataclass
 class Decision:
-    """Output of strategy.decide() — one order instruction per tick per role."""
-    side: str            # "Up" / "Down"
-    amount: int          # order size
-    price: float         # maker limit price (role-specific aggressiveness applied)
-    role: str            # "cheap" / "pairing" / "auto_pair"
-    lot_id: str | None = None  # pairing role: the lot being paired; cheap role: None
-    cancel_order_id: str | None = None  # pairer: cancel this cheap order before placing
-    auto_pair_key: str | None = None  # auto_pair & cheap share this to self-pair on fill
+    """Output of strategy.decide() — one order instruction per tick per side."""
+    side: str      # "Up" / "Down"
+    amount: int    # order size
+    price: float   # maker limit price
 
 
 @dataclass
@@ -151,8 +146,6 @@ class PendingOrder:
     filled: int = 0
     placed_at: float = 0.0
     cancelled_at: float = 0.0  # soft-delete timestamp; > 0 means cancel requested
-    pairing_lot_id: str | None = None  # pairing role: lot being paired; cheap: None
-    auto_pair_key: str | None = None  # matched key for auto_paired orders
 
     @property
     def remaining(self) -> int:

@@ -75,14 +75,20 @@ class Config:
     wallet_address: str = field(default_factory=lambda: _env("wallet_address"))
 
     # ── Strategy ──
+    profit_target: float = field(default_factory=lambda: _env_float("profit_target", 0.0))
+    """Coupled pricing profit target. 0 = disabled (independent pricing).
+    When > 0 (e.g. 0.03), lead side is priced at maker, derived side =
+    1.0 - lead_price - profit_target, guaranteeing profit per new pair."""
     per_tick: int = field(default_factory=lambda: _env_int("per_tick", 5))
     max_per_side: int = field(default_factory=lambda: _env_int("max_per_side", 500))
     aggressiveness: float = field(default_factory=lambda: _env_float("aggressiveness", 0.3))
-    pairing_aggressiveness: float = field(default_factory=lambda: _env_float("pairing_aggressiveness", 0.5))
-    """Aggressiveness for the pairing role — higher to increase fill probability."""
-    maker_fee: float = field(default_factory=lambda: _env_float("maker_fee", 0.0))
+    """Aggressiveness 0-1 — higher = more aggressive pricing (closer to best_ask)."""
     cancel_replace_threshold: float = field(default_factory=lambda: _env_float("cancel_replace_threshold", 0.10))
-    max_pair_sum: float = field(default_factory=lambda: _env_float("max_pair_sum", 1.0))
+    max_pair_sum: float = field(default_factory=lambda: _env_float("max_pair_sum", 0.98))
+    min_price_gap: float = field(default_factory=lambda: _env_float("min_price_gap", 0.02))
+    """Minimum price gap to place another order on the same side. If the current tick's
+    maker price is within this distance of any existing pending order, skip that side.
+    Prevents stacking multiple orders at nearly identical prices."""
 
     # ── Markets ──
     market_specs: list[MarketSpec] = field(default_factory=list)
@@ -92,16 +98,12 @@ class Config:
 
     # ── Risk ──
     min_order_size: int = field(default_factory=lambda: _env_int("min_order_size", 5))
-    max_imbalance: int = field(default_factory=lambda: _env_int("max_imbalance", 10))
-    """Hard cap on |N_up − N_down| — unpaired exposure limit."""
-    min_edge: float = field(default_factory=lambda: _env_float("min_edge", 0.05))
-    """Skip cheap-seeker buy when |Up − Down| price difference is below this threshold."""
     max_price_dev: float = field(default_factory=lambda: _env_float("max_price_dev", 0.20))
-    max_spread: float = field(default_factory=lambda: _env_float("max_spread", 0.05))
     max_extreme_price: float = field(default_factory=lambda: _env_float("max_extreme_price", 0.90))
     """Skip tick if either side's best_bid exceeds this (market is already settled)."""
-    max_pair_cost: float = field(default_factory=lambda: _env_float("max_pair_cost", 0.9999))
     min_pair_cost_fills: int = field(default_factory=lambda: _env_int("min_pair_cost_fills", 2))
+    max_imbalance: int = field(default_factory=lambda: _env_int("max_imbalance", 100))
+    """When the difference between Up and Down inventory exceeds this, stop adding to the heavy side."""
     kill_pnl_per_pair: float = field(default_factory=lambda: _env_float("kill_pnl_per_pair", 0.03))
     """Stop adding when guaranteed_pnl < -pairs × this (imbalance damage threshold)."""
     max_drawdown: float = field(default_factory=lambda: _env_float("max_drawdown", -10.0))
@@ -110,8 +112,10 @@ class Config:
     # ── Cancel-replace ──
     cancel_min_age: float = field(default_factory=lambda: _env_float("cancel_min_age", 30.0))
     """Minimum seconds a pending order must live before cancel-replace considers it."""
-    min_remaining_time: float = field(default_factory=lambda: _env_float("min_remaining_time", 300.0))
+    min_remaining_time: float = field(default_factory=lambda: _env_float("min_remaining_time", 180.0))
     """Stop placing new orders when fewer than this many seconds remain in the window."""
+    max_consecutive_failures: int = field(default_factory=lambda: _env_int("max_consecutive_failures", 15))
+    """Stop trying after this many consecutive ticks where all orders are rejected (balance likely depleted)."""
 
     # ── Connection ──
     ws_reconnect_delay: float = field(default_factory=lambda: _env_float("ws_reconnect_delay", 3.0))

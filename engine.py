@@ -52,7 +52,7 @@ from .models import (
     WindowStart,
     WindowState,
 )
-from .strategy import TemporalArbStrategy
+from .strategy import MakerStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -313,7 +313,7 @@ class TradingEngine:
         self.executor.engine = self
         self.sdk = SdkClient(cfg)
         self.prices = PriceCache()
-        self.strategy = TemporalArbStrategy(cfg)
+        self.strategy = MakerStrategy(cfg)
 
         # Multi-market state: keyed by slug_pattern (e.g. "btc-updown-5m")
         self._windows: dict[str, WindowState] = {}   # slug → current window state
@@ -377,6 +377,10 @@ class TradingEngine:
 
         # Create secure client for live trading
         await self.sdk.create_secure(self.cfg)
+
+        # Cancel any lingering orders from a previous instance
+        if self.sdk.is_secure:
+            await self.sdk.cancel_all_open_orders()
 
         db_path = f"poly_trader_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
         self._sqlite = SqliteRecorder(self, db_path)
@@ -598,7 +602,27 @@ class TradingEngine:
             down_token_id=market.down_token_id,
         ))
 
+        # ── Restore current positions (engine restart mid-window) ──
+        state = await self.sdk.load_current_state(market)
+        if state:
+            ws_state.inventory = state["inventory"]
+            ws_state.cost["Up"] = state["avg_cost"]["Up"] * state["inventory"]["Up"]
+            ws_state.cost["Down"] = state["avg_cost"]["Down"] * state["inventory"]["Down"]
+            ws_state.total_spent = ws_state.cost["Up"] + ws_state.cost["Down"]
+            ws_state.pending_orders = state["pending"]
+            ws_state.trades = sum(state["inventory"].values())
+            logger.info(
+                "  [restore] Loaded positions: Up=%d@%.4f Down=%d@%.4f "
+                "pending=%d balance=%d",
+                state["inventory"]["Up"], state["avg_cost"]["Up"],
+                state["inventory"]["Down"], state["avg_cost"]["Down"],
+                len(state["pending"]), state["balance"],
+            )
+
         # ── tick loop ──
+        consecutive_failures = 0
+        idle_log_ts = 0.0
+        no_price_log_ts = 0.0
         while self._running:
             now = time.time()
             remaining = window_end - now
@@ -614,31 +638,49 @@ class TradingEngine:
                 continue
             self._last_tick_time = now
 
-            # Resolve pair prices with cross-validation (Up + Down ≈ 1.0)
-            up_price, down_price = self._resolve_pair_prices(
-                market.up_token_id, market.down_token_id, market.slug,
-            )
-            if not up_price or not down_price:
-                continue
-
-            # Round to tick size
+            # Round to tick size (before price validation)
             up_tick = await self.sdk.get_tick_size(market.up_token_id)
             down_tick = await self.sdk.get_tick_size(market.down_token_id)
-            up_price = self.sdk.round_to_tick(up_price, up_tick)
-            down_price = self.sdk.round_to_tick(down_price, down_tick)
 
-            # Kill-switch: stop adding when guaranteed PnL is too negative.
-            # pair_cost check is now handled tick-level in strategy.py (Guard 4).
+            # ── Normal pricing ──
+            up_price, down_price = self._resolve_pair_prices(
+                market.up_token_id, market.down_token_id, market.slug,
+                up_tick, down_tick,
+                ws_state=ws_state,
+            )
+            if not up_price or not down_price:
+                if time.time() - no_price_log_ts > 30:
+                    up_snap = self.prices.get(market.up_token_id)
+                    down_snap = self.prices.get(market.down_token_id)
+                    logger.info(
+                        "  [%s] No valid prices — up=%s down=%s  up_age=%ds down_age=%ds",
+                        market.slug,
+                        f"{up_snap.best_bid:.4f}/{up_snap.best_ask:.4f}" if up_snap else "N/A",
+                        f"{down_snap.best_bid:.4f}/{down_snap.best_ask:.4f}" if down_snap else "N/A",
+                        time.time() - (up_snap.updated_at if up_snap else 0),
+                        time.time() - (down_snap.updated_at if down_snap else 0),
+                    )
+                    no_price_log_ts = time.time()
+                continue
+
+            # Kill-switch: stop adding when guaranteed PnL is too negative
             if ws_state.trades >= self.cfg.min_pair_cost_fills and ws_state.guaranteed_pairs > 0:
                 if ws_state.guaranteed_pnl < -ws_state.guaranteed_pairs * self.cfg.kill_pnl_per_pair:
+                    up_pending = sum(1 for po in ws_state.pending_orders.values()
+                                     if po.side == "Up" and po.cancelled_at == 0)
+                    down_pending = sum(1 for po in ws_state.pending_orders.values()
+                                       if po.side == "Down" and po.cancelled_at == 0)
                     logger.info(
-                        "[%s] Kill-switch: guaranteed_pnl %.2f < "
-                        "-%d×%.2f (= %.2f) → stop adding, cancelling…",
+                        "[%s] Kill-switch: g_pnl=%.2f < "
+                        "-%d×%.2f=%.2f  inv=(U=%d/D=%d) pending=(U=%d/D=%d) pairs=%d",
                         market.slug,
                         ws_state.guaranteed_pnl,
                         ws_state.guaranteed_pairs,
                         self.cfg.kill_pnl_per_pair,
                         -ws_state.guaranteed_pairs * self.cfg.kill_pnl_per_pair,
+                        ws_state.inventory["Up"], ws_state.inventory["Down"],
+                        up_pending, down_pending,
+                        ws_state.guaranteed_pairs,
                     )
                     await self.executor.cancel_all(ws_state.pending_orders)
                     ws_state.pending_orders.clear()
@@ -646,23 +688,18 @@ class TradingEngine:
                     break
 
             # Cancel-replace: reprice stale pending orders
-            # Flush soft-deleted orders from previous cancel cycles first
             await self.executor.flush_cancelled()
-            up_snap = self.prices.get(market.up_token_id)
-            down_snap = self.prices.get(market.down_token_id)
-            await self._cancel_stale_pending(ws_state, up_price, down_price,
-                                             up_snap, down_snap)
+            await self._cancel_stale_pending(ws_state, up_price, down_price)
 
             decisions = self.strategy.decide(
                 ws_state, up_price, down_price,
                 remaining_time=remaining,
-                up_snap=up_snap, down_snap=down_snap,
             )
 
             # Summarise decisions for tick event
             up_buy = sum(d.amount for d in decisions if d.side == "Up")
             down_buy = sum(d.amount for d in decisions if d.side == "Down")
-            roles = "/".join(d.role for d in decisions) if decisions else "idle"
+            sides = "+".join(d.side for d in decisions) if decisions else "idle"
 
             # Only emit tick events for active ticks (reduce idle log spam)
             if decisions:
@@ -675,21 +712,54 @@ class TradingEngine:
                     price_sum=round(up_price + down_price, 4),
                     up_buy=up_buy,
                     down_buy=down_buy,
-                    roles=roles,
+                    roles=sides,
                 ))
+                idle_log_ts = now  # reset idle timer on activity
 
-            # Process cancellations first (pairer overriding cheap orders)
-            for d in decisions:
-                if d.cancel_order_id:
-                    await self.executor.cancel(d.cancel_order_id)
+            # Idle log — throttled to every 30s
+            if not decisions and now - idle_log_ts > 30:
+                logger.info(
+                    "  [%s] Idle — Up=%.4f Down=%.4f sum=%.4f  inv=(U=%d/D=%d) pending=%d  remaining=%ds",
+                    market.slug, up_price, down_price, up_price + down_price,
+                    ws_state.inventory["Up"], ws_state.inventory["Down"],
+                    len(ws_state.pending_orders), int(remaining),
+                )
+                idle_log_ts = now
 
+            # ── Place orders independently (no atomic submit, no role routing) ──
+            if decisions:
+                # Log pending order state for anomaly detection
+                for side in ("Up", "Down"):
+                    side_pending = [po for po in ws_state.pending_orders.values()
+                                    if po.side == side and po.cancelled_at == 0]
+                    if side_pending:
+                        prices = {po.order_id[:8]: f"{po.price:.4f}" for po in side_pending}
+                        logger.info("  [%s] Pending %s: %d orders  prices=%s  inv=%d",
+                                    market.slug, side, len(side_pending), prices,
+                                    ws_state.inventory[side])
+
+            # ── Place orders, track success/failure ──
+            tick_any_ok = False
             for d in decisions:
                 token_id = market.up_token_id if d.side == "Up" else market.down_token_id
-                await self._place_order(
-                    market.slug, token_id, d.side, d.price, d.amount,
-                    pairing_lot_id=d.lot_id,
-                    auto_pair_key=d.auto_pair_key,
-                )
+                ok = await self._place_order(market.slug, token_id, d.side, d.price, d.amount)
+                if ok:
+                    tick_any_ok = True
+
+            # ── Consecutive failure → idle (likely out of balance) ──
+            if decisions:
+                if tick_any_ok:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= self.cfg.max_consecutive_failures:
+                        logger.warning(
+                            "[%s] %d consecutive ticks ALL orders rejected "
+                            "(likely out of balance) → idle until settlement",
+                            market.slug, consecutive_failures,
+                        )
+                        await asyncio.sleep(max(0.0, window_end - time.time() - 1))
+                        break
 
             if ws_state.is_full(self.cfg.max_per_side):
                 logger.info("[%s] Both sides full → idle until window end", market.slug)
@@ -706,15 +776,17 @@ class TradingEngine:
 
     def _resolve_pair_prices(
         self, up_token_id: str, down_token_id: str, slug: str,
+        up_tick: float = 0.01, down_tick: float = 0.01,
+        ws_state: Optional[WindowState] = None,
     ) -> tuple[Optional[float], Optional[float]]:
         """Cross-validate Up/Down prices using WS orderbook data only.
+
+        Rounds to tick size before validation, so returned prices are
+        ready to use for order placement.
 
         Skips the tick if:
           - No fresh price data (WS data > 30s old)
           - Up + Down deviates from 1.0 beyond max_price_dev
-
-        Note: spread is NOT checked — post-only limit orders are valid
-        regardless of market spread.
 
         Returns (up_price, down_price) or (None, None) to skip.
         """
@@ -724,10 +796,15 @@ class TradingEngine:
 
         # Must have fresh data for both sides
         if not up_snap or not down_snap:
-            logger.info("[%s] OrderBook snap missing → skip", slug)
+            logger.info("[%s] OrderBook snap missing → skip  (up=%s down=%s)",
+                        slug, bool(up_snap), bool(down_snap))
             return None, None
-        if (now - up_snap.updated_at) > 30 or (now - down_snap.updated_at) > 30:
-            logger.info("[%s] Price data stale → skip", slug)
+
+        up_age = now - up_snap.updated_at
+        down_age = now - down_snap.updated_at
+        if up_age > 30 or down_age > 30:
+            logger.info("[%s] Price data stale → skip  (up_age=%.1fs down_age=%.1fs)",
+                        slug, up_age, down_age)
             return None, None
 
         # Must have both bid and ask
@@ -750,23 +827,65 @@ class TradingEngine:
                         slug, down_snap.best_bid, self.cfg.max_extreme_price)
             return None, None
 
-        # Compute maker prices from order books
-        up_price = self._maker_price(up_snap)
-        down_price = self._maker_price(down_snap)
+        # ── Coupled pricing (profit target mode) ──
+        profit_target = self.cfg.profit_target
+        if profit_target > 0 and ws_state is not None:
+            # Lead side = side with LESS inventory (balance-seeking)
+            inv_up = ws_state.inventory["Up"]
+            inv_down = ws_state.inventory["Down"]
+            lead_side = "Up" if inv_down >= inv_up else "Down"
 
-        # Skip if sum too high (no edge — Up+Down must be < 1.0 to profit)
-        total = up_price + down_price
-        if total >= self.cfg.max_pair_sum:
-            logger.info("[%s] Price sum %.4f >= %.2f → skip (no edge)", slug, total, self.cfg.max_pair_sum)
-            return None, None
+            if lead_side == "Up":
+                raw = self._maker_price(up_snap)
+                up_price = self.sdk.round_to_tick(raw, up_tick)
+                down_raw = 1.0 - up_price - profit_target
+                down_price = self.sdk.round_to_tick(down_raw, down_tick)
+                # Check derived side is fillable — skip if below best_bid
+                if down_snap.best_bid and down_price < down_snap.best_bid:
+                    logger.info("[%s] Coupled: derived Down=%.4f < bid=%.4f → skip (won't fill)",
+                                slug, down_price, down_snap.best_bid)
+                    return None, None
+            else:
+                raw = self._maker_price(down_snap)
+                down_price = self.sdk.round_to_tick(raw, down_tick)
+                up_raw = 1.0 - down_price - profit_target
+                up_price = self.sdk.round_to_tick(up_raw, up_tick)
+                if up_snap.best_bid and up_price < up_snap.best_bid:
+                    logger.info("[%s] Coupled: derived Up=%.4f < bid=%.4f → skip (won't fill)",
+                                slug, up_price, up_snap.best_bid)
+                    return None, None
 
-        # Cross-validate: Up + Down ≈ 1.0
-        if abs(total - 1.0) > self.cfg.max_price_dev:
+            total = up_price + down_price
             logger.info(
-                "[%s] Price sum %.4f out of range → skip",
-                slug, total,
+                "[%s] Coupled pricing: lead=%s sum=%.4f target=%.2f → Up=%.4f Down=%.4f",
+                slug, lead_side, total, profit_target, up_price, down_price,
             )
-            return None, None
+
+            if up_price <= 0 or down_price <= 0:
+                logger.info("[%s] Coupled prices invalid: Up=%.4f Down=%.4f → skip",
+                            slug, up_price, down_price)
+                return None, None
+            if total >= 1.0:
+                logger.info("[%s] Coupled sum %.4f >= 1.0 → skip", slug, total)
+                return None, None
+        else:
+            # ── Standard independent pricing ──
+            up_price = self._maker_price(up_snap)
+            down_price = self._maker_price(down_snap)
+            up_price = self.sdk.round_to_tick(up_price, up_tick)
+            down_price = self.sdk.round_to_tick(down_price, down_tick)
+
+            # Skip if sum too high (no edge)
+            total = up_price + down_price
+            if total >= self.cfg.max_pair_sum:
+                logger.info("[%s] Price sum %.4f >= %.2f → skip (no edge)",
+                            slug, total, self.cfg.max_pair_sum)
+                return None, None
+
+            # Cross-validate: Up + Down ≈ 1.0
+            if abs(total - 1.0) > self.cfg.max_price_dev:
+                logger.info("[%s] Price sum %.4f out of range → skip", slug, total)
+                return None, None
 
         return up_price, down_price
 
@@ -777,59 +896,41 @@ class TradingEngine:
         return round(snap.best_bid + snap.spread * self.cfg.aggressiveness, 4)
 
     async def _cancel_stale_pending(self, ws: WindowState, up_price: float,
-                                     down_price: float,
-                                     up_snap=None, down_snap=None):
+                                     down_price: float):
         """Cancel pending orders whose price has moved beyond the threshold.
 
-        For cheap-seeker orders, compares against the cheap-aggressiveness
-        reference price.  For pairing orders, compares against the
-        pairing-aggressiveness reference price computed from the raw
-        orderbook snapshot.
-
-        Calls executor.cancel() so the cancellation happens on the exchange.
+        Compares each pending order's price to the current maker reference
+        price computed by _maker_price.  Skips orders younger than cancel_min_age.
         """
         threshold = self.cfg.cancel_replace_threshold
         min_age = self.cfg.cancel_min_age
         now = time.time()
         for oid in list(ws.pending_orders):
             po = ws.pending_orders[oid]
-            # Skip already-cancelled orders (awaiting grace-period flush)
             if po.cancelled_at > 0:
                 continue
-            # Guard 1: let fresh orders sit on the book
             if now - po.placed_at < min_age:
                 continue
-            # Guard 2: compute reference price using the order's own role
-            if po.pairing_lot_id is not None:
-                # Pairing order — use pairing aggressiveness from raw snap
-                snap = up_snap if po.side == "Up" else down_snap
-                if not snap or not snap.best_bid or not snap.best_ask:
-                    continue
-                raw = snap.best_bid + snap.spread * self.cfg.pairing_aggressiveness
-                # Apply the same max_pair_cost cap as strategy.decide()
-                lot = next((l for l in ws.lots if l.lot_id == po.pairing_lot_id), None)
-                if lot is not None:
-                    cap = self.cfg.max_pair_cost - lot.price
-                    current_price = round(min(raw, cap), 4)
-                else:
-                    current_price = raw
-            else:
-                current_price = up_price if po.side == "Up" else down_price
-            max_p = max(po.price, 0.001)
-            if abs(po.price - current_price) / max_p > threshold:
+            current_price = up_price if po.side == "Up" else down_price
+            deviation = abs(po.price - current_price) / max(po.price, 0.001)
+            if deviation > threshold:
+                logger.info(
+                    "  [cancel-replace] %s order=%s… old=%.4f new=%.4f "
+                    "dev=%.1f%% thresh=%.0f%% age=%.0fs",
+                    po.side, oid[:12], po.price, current_price,
+                    deviation * 100, threshold * 100,
+                    now - po.placed_at,
+                )
                 await self.executor.cancel(oid)
 
     # ── Order execution ──
 
     async def _place_order(self, slug: str, token_id: str, outcome: str,
-                           price: float, amount: int,
-                           pairing_lot_id: str | None = None,
-                           auto_pair_key: str | None = None):
-        await self.executor.place(
+                           price: float, amount: int) -> bool:
+        oid = await self.executor.place(
             slug, token_id, outcome, price, amount,
-            pairing_lot_id=pairing_lot_id,
-            auto_pair_key=auto_pair_key,
         )
+        return oid is not None
 
     # ── Settlement ──
 
@@ -839,24 +940,57 @@ class TradingEngine:
 
         # Cancel remaining pending orders
         await self.executor.cancel_all(ws.pending_orders)
-        # cancel_all handles flush internally; remaining are edge-case stragglers
         ws.pending_orders.clear()
 
-        # Determine winner — prefer Gamma API (actual resolution), fall back to WS midpoints
         winner = None
 
-        # Tier 1: Query Gamma API for resolved outcome
-        for attempt in range(3):
+        # Tier 1: Gamma API — retry longer for oracle to resolve
+        for attempt in range(10):
             winner = await self.sdk.get_resolved_winner(market.slug)
             if winner is not None:
                 logger.info("  [%s] API resolved winner: %s (attempt %d)", market.slug, winner, attempt + 1)
                 break
-            if attempt < 2:
-                await asyncio.sleep(2)  # wait for oracle to settle
+            await asyncio.sleep(3)
 
-        # Tier 2: Fall back to WS midpoint heuristic if API didn't resolve
+        # Tier 2: Last trade price from Gamma Data API
         if winner is None:
-            logger.warning("  [%s] API not resolved, falling back to WS midpoint guess", market.slug)
+            logger.warning("  [%s] API not resolved, querying last trade prices…", market.slug)
+            try:
+                import httpx
+                url = "https://data-api.polymarket.com/trades"
+                params = {"market": market.condition_id, "limit": 100}
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(url, params=params, timeout=10)
+                    if resp.status_code == 200:
+                        trades = resp.json()
+                        if trades:
+                            # Use last trade of each outcome
+                            last_up = 0.0
+                            last_down = 0.0
+                            for t in trades:
+                                ts = int(t.get("timestamp", 0))
+                                price = float(t.get("price", 0))
+                                if t.get("asset", "") == market.up_token_id or t.get("outcome") == "Up":
+                                    last_up = price
+                                elif t.get("asset", "") == market.down_token_id or t.get("outcome") == "Down":
+                                    last_down = price
+                            if last_up >= 0.99 and last_down <= 0.01:
+                                winner = "Up"
+                                logger.info("  [%s] Trades resolved: Up=%.4f Down=%.4f → %s",
+                                            market.slug, last_up, last_down, winner)
+                            elif last_down >= 0.99 and last_up <= 0.01:
+                                winner = "Down"
+                                logger.info("  [%s] Trades resolved: Up=%.4f Down=%.4f → %s",
+                                            market.slug, last_up, last_down, winner)
+                            else:
+                                logger.info("  [%s] Trades ambiguous: Up=%.4f Down=%.4f → fallback",
+                                            market.slug, last_up, last_down)
+            except Exception as e:
+                logger.warning("  [%s] Trades API error: %s", market.slug, e)
+
+        # Tier 3: WS midpoint as last resort
+        if winner is None:
+            logger.warning("  [%s] Using WS midpoint as last resort", market.slug)
             up_snap = self.prices.get(market.up_token_id)
             down_snap = self.prices.get(market.down_token_id)
             up_mid = up_snap.mid_price if up_snap else None

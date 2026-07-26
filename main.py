@@ -88,8 +88,10 @@ async def async_main(args: argparse.Namespace):
 
 
 async def check_credentials(cfg: Config):
-    """Verify Polymarket credentials work."""
+    """Verify Polymarket credentials work. Exits with 1 on failure."""
     from .client import SdkClient
+
+    ok = True
 
     print(f"{'═' * 50}")
     print("  Credential Check")
@@ -98,26 +100,31 @@ async def check_credentials(cfg: Config):
 
     if not cfg.private_key:
         print("❌  POLY_PRIVATE_KEY / POLYMARKET_PK 未设置")
-        return
-
-    print(f"  私钥:  {cfg.private_key[:20]}...")
-    print(f"  钱包:  {cfg.wallet_address or '(自动派生)'}")
-    print()
-
-    sdk = SdkClient(cfg)
-    try:
-        await sdk.create_secure(cfg)
-        if not sdk.is_secure:
-            print("❌  SecureClient 创建失败 — 私钥或钱包地址无效")
-            return
-        print("✅  私钥有效")
-        print(f"✅  钱包: {cfg.wallet_address}")
+        ok = False
+    else:
+        print(f"  私钥:  {cfg.private_key[:20]}...")
+        print(f"  钱包:  {cfg.wallet_address or '(自动派生)'}")
         print()
-        print("  凭证就绪，可以启动实盘。")
-    except Exception as e:
-        print(f"❌  凭证无效: {e}")
-    finally:
-        await sdk.close()
+
+        sdk = SdkClient(cfg)
+        try:
+            await sdk.create_secure(cfg)
+            if not sdk.is_secure:
+                print("❌  SecureClient 创建失败 — 私钥或钱包地址无效")
+                ok = False
+            else:
+                print("✅  私钥有效")
+                print(f"✅  钱包: {cfg.wallet_address}")
+                print()
+                print("  凭证就绪，可以启动实盘。")
+        except Exception as e:
+            print(f"❌  凭证无效: {e}")
+            ok = False
+        finally:
+            await sdk.close()
+
+    if not ok:
+        sys.exit(1)
 
 
 def main():
