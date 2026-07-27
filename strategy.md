@@ -94,7 +94,6 @@ Up + Down ≈ $1 始终成立（买要付 ask，合计 ask > 1）
 
 | 参数 | 默认值 | 作用 |
 |------|--------|------|
-| `max_imbalance` (K) | 10 | 硬上限 — 单边敞口超过此值停止加该侧 |
 | `max_per_side` | 20 | 单边最大持仓 |
 | `max_drawdown` | -5.0 | 会话回撤熔断 |
 | `stop_on_window_loss` | true | 窗口亏损 → 跳过下一窗口 |

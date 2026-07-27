@@ -219,7 +219,8 @@ class SqliteRecorder:
                 price       REAL    NOT NULL,
                 amount      INTEGER NOT NULL,
                 status      TEXT    NOT NULL DEFAULT 'placed',
-                created_at  TEXT    NOT NULL
+                created_at  TEXT    NOT NULL,
+                order_id    TEXT    NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS fills (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -234,15 +235,21 @@ class SqliteRecorder:
             CREATE INDEX IF NOT EXISTS idx_fills_window   ON fills(window_num);
         """)
         self._conn.commit()
+        # Migrate older DBs that lack order_id column
+        try:
+            self._conn.execute("ALTER TABLE orders ADD COLUMN order_id TEXT NOT NULL DEFAULT ''")
+            self._conn.commit()
+        except Exception:
+            pass
 
     # ── handlers ──
 
     async def _on_placed(self, ev: OrderPlaced):
         now = datetime.now(tz=timezone.utc).isoformat()
         self._conn.execute(
-            "INSERT INTO orders (window_num, outcome, side, price, amount, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (ev.window_num, ev.outcome, ev.side, ev.price, ev.amount, "placed", now),
+            "INSERT INTO orders (window_num, outcome, side, price, amount, status, created_at, order_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (ev.window_num, ev.outcome, ev.side, ev.price, ev.amount, "placed", now, ev.order_id),
         )
         self._conn.commit()
 
@@ -253,16 +260,22 @@ class SqliteRecorder:
             "VALUES (?, ?, ?, ?, ?, ?)",
             (ev.window_num, ev.order_id, ev.outcome, ev.price, ev.amount, now),
         )
-        self._conn.execute(
-            "UPDATE orders SET status='filled' WHERE window_num=? AND outcome=? AND status IN ('placed','partial')",
-            (ev.window_num, ev.outcome),
-        )
+        # Precise update: only mark the specific filled order
+        row = self._conn.execute(
+            "SELECT amount FROM orders WHERE order_id=?", (ev.order_id,)
+        ).fetchone()
+        if row:
+            new_status = 'filled' if ev.total_filled >= row[0] else 'partial'
+            self._conn.execute(
+                "UPDATE orders SET status=? WHERE order_id=?",
+                (new_status, ev.order_id),
+            )
         self._conn.commit()
 
     async def _on_cancelled(self, ev: OrderCancelled):
         self._conn.execute(
-            "UPDATE orders SET status='cancelled' WHERE window_num=? AND outcome=? AND status='placed'",
-            (ev.window_num, ev.outcome),
+            "UPDATE orders SET status='cancelled' WHERE order_id=? AND status IN ('placed','partial')",
+            (ev.order_id,),
         )
         self._conn.commit()
 
@@ -648,7 +661,7 @@ class TradingEngine:
                 up_tick, down_tick,
                 ws_state=ws_state,
             )
-            if not up_price or not down_price:
+            if not up_price and not down_price:
                 if time.time() - no_price_log_ts > 30:
                     up_snap = self.prices.get(market.up_token_id)
                     down_snap = self.prices.get(market.down_token_id)
@@ -726,7 +739,7 @@ class TradingEngine:
                 )
                 idle_log_ts = now
 
-            # ── Place orders independently (no atomic submit, no role routing) ──
+            # ── Place orders — batch pair when both sides ──
             if decisions:
                 # Log pending order state for anomaly detection
                 for side in ("Up", "Down"):
@@ -740,11 +753,24 @@ class TradingEngine:
 
             # ── Place orders, track success/failure ──
             tick_any_ok = False
-            for d in decisions:
-                token_id = market.up_token_id if d.side == "Up" else market.down_token_id
-                ok = await self._place_order(market.slug, token_id, d.side, d.price, d.amount)
-                if ok:
-                    tick_any_ok = True
+            if len(decisions) == 2:
+                # Both sides → sign together, submit together
+                up_d = next(d for d in decisions if d.side == "Up")
+                down_d = next(d for d in decisions if d.side == "Down")
+                up_ok, down_ok = await self.executor.place_pair(
+                    market.slug,
+                    market.up_token_id, market.down_token_id,
+                    up_d.price, up_d.amount,
+                    down_d.price, down_d.amount,
+                )
+                tick_any_ok = up_ok or down_ok
+            else:
+                # Single side → use existing individual placement
+                for d in decisions:
+                    token_id = market.up_token_id if d.side == "Up" else market.down_token_id
+                    ok = await self._place_order(market.slug, token_id, d.side, d.price, d.amount)
+                    if ok:
+                        tick_any_ok = True
 
             # ── Consecutive failure → idle (likely out of balance) ──
             if decisions:
@@ -830,44 +856,82 @@ class TradingEngine:
         # ── Coupled pricing (profit target mode) ──
         profit_target = self.cfg.profit_target
         if profit_target > 0 and ws_state is not None:
-            # Lead side = side with LESS inventory (balance-seeking)
             inv_up = ws_state.inventory["Up"]
             inv_down = ws_state.inventory["Down"]
-            lead_side = "Up" if inv_down >= inv_up else "Down"
+
+            # Compute raw maker prices for both sides
+            up_raw = self._maker_price(up_snap)
+            down_raw = self._maker_price(down_snap)
+
+            # Lead = side with LESS inventory; tie → cheaper side
+            if inv_up < inv_down:
+                lead_side = "Up"
+            elif inv_down < inv_up:
+                lead_side = "Down"
+            else:
+                lead_side = "Up" if up_raw <= down_raw else "Down"
 
             if lead_side == "Up":
-                raw = self._maker_price(up_snap)
+                raw = up_raw
                 up_price = self.sdk.round_to_tick(raw, up_tick)
-                down_raw = 1.0 - up_price - profit_target
-                down_price = self.sdk.round_to_tick(down_raw, down_tick)
-                # Check derived side is fillable — skip if below best_bid
-                if down_snap.best_bid and down_price < down_snap.best_bid:
-                    logger.info("[%s] Coupled: derived Down=%.4f < bid=%.4f → skip (won't fill)",
-                                slug, down_price, down_snap.best_bid)
-                    return None, None
+                target = 0.02 if 0.30 <= raw <= 0.70 else 0.01
+                # Derived side: use best_bid if it already meets profit target
+                opp_bid = down_snap.best_bid
+                if opp_bid and 1.0 - up_price - opp_bid >= target:
+                    down_price = opp_bid
+                    logger.info("[%s] Coupled: best_bid Down=%.4f profit=%.4f >= target=%.2f → use bid",
+                                slug, down_price, 1.0 - up_price - down_price, target)
+                elif opp_bid:
+                    if 1.0 - up_price - opp_bid < 0:
+                        logger.info("[%s] Coupled: Up=%.4f + Down bid=%.4f = %.4f > 1.0 → skip",
+                                    slug, up_price, opp_bid, up_price + opp_bid)
+                        return None, None
+                    # Can't meet target, but still place at best_bid for pairing
+                    down_price = opp_bid
+                    logger.info("[%s] Coupled: Down=bid=%.4f profit=%.4f < target=%.2f (place anyway for pairing)",
+                                slug, down_price, 1.0 - up_price - down_price, target)
+                else:
+                    down_raw_price = 1.0 - up_price - target
+                    down_price = self.sdk.round_to_tick(down_raw_price, down_tick)
             else:
-                raw = self._maker_price(down_snap)
+                raw = down_raw
                 down_price = self.sdk.round_to_tick(raw, down_tick)
-                up_raw = 1.0 - down_price - profit_target
-                up_price = self.sdk.round_to_tick(up_raw, up_tick)
-                if up_snap.best_bid and up_price < up_snap.best_bid:
-                    logger.info("[%s] Coupled: derived Up=%.4f < bid=%.4f → skip (won't fill)",
-                                slug, up_price, up_snap.best_bid)
-                    return None, None
+                target = 0.02 if 0.30 <= raw <= 0.70 else 0.01
+                opp_bid = up_snap.best_bid
+                if opp_bid and 1.0 - down_price - opp_bid >= target:
+                    up_price = opp_bid
+                    logger.info("[%s] Coupled: best_bid Up=%.4f profit=%.4f >= target=%.2f → use bid",
+                                slug, up_price, 1.0 - down_price - up_price, target)
+                elif opp_bid:
+                    if 1.0 - down_price - opp_bid < 0:
+                        logger.info("[%s] Coupled: Down=%.4f + Up bid=%.4f = %.4f > 1.0 → skip",
+                                    slug, down_price, opp_bid, down_price + opp_bid)
+                        return None, None
+                    # Can't meet target, but still place at best_bid for pairing
+                    up_price = opp_bid
+                    logger.info("[%s] Coupled: Up=bid=%.4f profit=%.4f < target=%.2f (place anyway for pairing)",
+                                slug, up_price, 1.0 - down_price - up_price, target)
+                else:
+                    up_raw_price = 1.0 - down_price - target
+                    up_price = self.sdk.round_to_tick(up_raw_price, up_tick)
+
+            # One side must be valid
+            if up_price <= 0 and down_price <= 0:
+                logger.info("[%s] Coupled: both sides invalid → skip", slug)
+                return None, None
 
             total = up_price + down_price
-            logger.info(
-                "[%s] Coupled pricing: lead=%s sum=%.4f target=%.2f → Up=%.4f Down=%.4f",
-                slug, lead_side, total, profit_target, up_price, down_price,
-            )
-
-            if up_price <= 0 or down_price <= 0:
-                logger.info("[%s] Coupled prices invalid: Up=%.4f Down=%.4f → skip",
-                            slug, up_price, down_price)
-                return None, None
-            if total >= 1.0:
-                logger.info("[%s] Coupled sum %.4f >= 1.0 → skip", slug, total)
-                return None, None
+            if up_price > 0 and down_price > 0:
+                logger.info(
+                    "[%s] Coupled pair: lead=%s target=%.2f sum=%.4f → Up=%.4f Down=%.4f",
+                    slug, lead_side, target, total, up_price, down_price,
+                )
+            else:
+                solo_side = "Up" if up_price > 0 else "Down"
+                logger.info(
+                    "[%s] Coupled solo: lead=%s target=%.2f → %s=%.4f",
+                    slug, lead_side, target, solo_side, up_price if up_price > 0 else down_price,
+                )
         else:
             # ── Standard independent pricing ──
             up_price = self._maker_price(up_snap)
@@ -875,16 +939,11 @@ class TradingEngine:
             up_price = self.sdk.round_to_tick(up_price, up_tick)
             down_price = self.sdk.round_to_tick(down_price, down_tick)
 
-            # Skip if sum too high (no edge)
+            # Cross-validate: Up + Down ≤ 1.0 — skip if sum exceeds 1.0 (guaranteed loss)
             total = up_price + down_price
-            if total >= self.cfg.max_pair_sum:
-                logger.info("[%s] Price sum %.4f >= %.2f → skip (no edge)",
-                            slug, total, self.cfg.max_pair_sum)
-                return None, None
-
-            # Cross-validate: Up + Down ≈ 1.0
-            if abs(total - 1.0) > self.cfg.max_price_dev:
-                logger.info("[%s] Price sum %.4f out of range → skip", slug, total)
+            if total > 1.0:
+                logger.info("[%s] Price sum %.4f > 1.0 → skip (independent pricing)",
+                            slug, total)
                 return None, None
 
         return up_price, down_price

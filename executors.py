@@ -42,6 +42,18 @@ class OrderExecutor:
                     price: float, amount: int) -> Optional[str]:
         raise NotImplementedError
 
+    async def place_pair(
+        self, slug: str,
+        up_token_id: str, down_token_id: str,
+        up_price: float, up_amount: int,
+        down_price: float, down_amount: int,
+    ) -> tuple[bool, bool]:
+        """Place paired Up+Down orders — sign both, submit together.
+
+        Returns (up_ok, down_ok).  Base class raises NotImplementedError.
+        """
+        raise NotImplementedError
+
     async def cancel(self, order_id: str) -> bool:
         raise NotImplementedError
 
@@ -159,6 +171,7 @@ class LiveExecutor(OrderExecutor):
                             window_num=ws2.window_num,
                             outcome=outcome, price=fill_price, amount=fill_size,
                             order_id=oid,
+                            total_filled=po2.filled,
                             total_inv_up=ws2.inventory["Up"],
                             total_inv_down=ws2.inventory["Down"],
                         ))
@@ -173,6 +186,121 @@ class LiveExecutor(OrderExecutor):
             reason="SDK place failed",
         ))
         return None
+
+    async def place_pair(
+        self, slug: str,
+        up_token_id: str, down_token_id: str,
+        up_price: float, up_amount: int,
+        down_price: float, down_amount: int,
+    ) -> tuple[bool, bool]:
+        """Place paired Up+Down orders — sign both, submit together.
+
+        1. Sign both orders in parallel (EIP-712)
+        2. Submit both via post_orders (single HTTP request)
+        3. Process each result: register pending orders, emit events
+        """
+        ws = self.engine._windows.get(slug)
+        if ws is None:
+            return False, False
+
+        # 1. Sign both orders in parallel
+        up_signed, down_signed = await asyncio.gather(
+            self.engine.sdk.create_signed_limit_order(up_token_id, "BUY", up_price, up_amount),
+            self.engine.sdk.create_signed_limit_order(down_token_id, "BUY", down_price, down_amount),
+        )
+
+        # Map signed orders to their sides
+        to_submit = []
+        side_map: list[str] = []
+        if up_signed:
+            to_submit.append(up_signed)
+            side_map.append("Up")
+        if down_signed:
+            to_submit.append(down_signed)
+            side_map.append("Down")
+
+        if not to_submit:
+            logger.warning("  [place_pair] Both signed order creation FAILED")
+            await self.engine._emit("order_failed", OrderFailed(
+                window_num=ws.window_num,
+                outcome="Up", price=up_price, amount=up_amount,
+                reason="Sign failed",
+            ))
+            await self.engine._emit("order_failed", OrderFailed(
+                window_num=ws.window_num,
+                outcome="Down", price=down_price, amount=down_amount,
+                reason="Sign failed",
+            ))
+            return False, False
+
+        # Logging
+        logger.info(
+            "  [place_pair] Submitting %d/%d orders (post_only)  "
+            "Up=%d@%.4f Down=%d@%.4f",
+            len(to_submit), 2,
+            up_amount, up_price, down_amount, down_price,
+        )
+
+        # 2. Submit together
+        order_ids = await self.engine.sdk.submit_orders(to_submit)
+
+        # 3. Process results
+        up_ok = False
+        down_ok = False
+
+        for side, oid in zip(side_map, order_ids):
+            price = up_price if side == "Up" else down_price
+            amount = up_amount if side == "Up" else down_amount
+            token_id = up_token_id if side == "Up" else down_token_id
+
+            if oid is None:
+                logger.warning("  [place_pair] %s REJECTED", side)
+                await self.engine._emit("order_failed", OrderFailed(
+                    window_num=ws.window_num,
+                    outcome=side, price=price, amount=amount,
+                    reason="Pair submission rejected",
+                ))
+                continue
+
+            # Accepted — register pending order
+            ws.pending_orders[oid] = PendingOrder(
+                order_id=oid, token_id=token_id,
+                side=side, buy_sell="BUY",
+                price=price, amount=amount,
+                placed_at=time.time(),
+            )
+            await self.engine._emit("order_placed", OrderPlaced(
+                window_num=ws.window_num,
+                outcome=side, side="BUY",
+                price=price, amount=amount,
+                order_id=oid,
+            ))
+
+            # Check orphan fills (fill arrived before we registered the order)
+            orphan = self._orphan_fills.pop(oid, None)
+            if orphan:
+                logger.info("  [place_pair] Processing orphan fill for %s…", oid[:12])
+                po = ws.pending_orders.get(oid)
+                if po:
+                    fill_size, fill_price, _ = orphan
+                    self._process_fill(ws, po, fill_size, fill_price)
+                    await self.engine._emit("order_filled", OrderFilled(
+                        window_num=ws.window_num,
+                        outcome=side, price=fill_price, amount=fill_size,
+                        order_id=oid,
+                        total_filled=po.filled,
+                        total_inv_up=ws.inventory["Up"],
+                        total_inv_down=ws.inventory["Down"],
+                    ))
+                    if po.remaining <= 0:
+                        del ws.pending_orders[oid]
+
+            if side == "Up":
+                up_ok = True
+            else:
+                down_ok = True
+
+        return up_ok, down_ok
 
     async def cancel(self, order_id: str) -> bool:
         """Soft-delete: mark cancelled_at instead of deleting immediately.
@@ -295,6 +423,7 @@ class LiveExecutor(OrderExecutor):
                     window_num=ws.window_num,
                     outcome=po.side, price=fill_price, amount=fill_size,
                     order_id=oid,
+                    total_filled=po.filled,
                     total_inv_up=ws.inventory["Up"],
                     total_inv_down=ws.inventory["Down"],
                 ))

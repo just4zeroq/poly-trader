@@ -60,89 +60,85 @@ class MakerStrategy:
         exposure_up = inv_up + pending_up
         exposure_down = inv_down + pending_down
 
-        # ── Price proximity check (global: any side too close → skip tick) ──
-        # If either side's price is too close to an existing pending order on
-        # that side, skip the entire tick.  Prevents single-sided accumulation
-        # when one side's orders won't fill while the other keeps buying.
-        up_too_close = any(
-            abs(po.price - up_price) < cfg.min_price_gap
-            for po in ws.pending_orders.values()
-            if po.side == "Up" and po.cancelled_at == 0
-        )
-        down_too_close = any(
-            abs(po.price - down_price) < cfg.min_price_gap
-            for po in ws.pending_orders.values()
-            if po.side == "Down" and po.cancelled_at == 0
-        )
-        if up_too_close or down_too_close:
-            logger.info(
-                "  [maker] Skip tick: price too close to pending order "
-                "(min_gap=%.4f)  Up_close=%s Down_close=%s  "
-                "Up=%.4f Down=%.4f  pending_U=%d D=%d",
-                cfg.min_price_gap, up_too_close, down_too_close,
-                up_price, down_price, pending_up, pending_down,
+        # ── Atomic pre-check: if either side fails price proximity, skip both ──
+        # Prevents deadlock where one side keeps placing while the other is stuck
+        # because its price is too close to an existing pending order.
+        for side, price in [("Up", up_price), ("Down", down_price)]:
+            if price <= 0:
+                continue
+            too_close = any(
+                abs(po.price - price) < cfg.min_price_gap
+                for po in ws.pending_orders.values()
+                if po.side == side and po.cancelled_at == 0
             )
-            return decisions
+            if too_close:
+                logger.info(
+                    "  [maker] Atomic skip: %s price %.4f too close to pending "
+                    "(min_gap=%.4f) \u2192 skip both sides",
+                    side, price, cfg.min_price_gap,
+                )
+                return decisions  # empty \u2192 skip both Up and Down
 
         for side, price, exposure in [
             ("Up", up_price, exposure_up),
             ("Down", down_price, exposure_down),
         ]:
+            if price <= 0:
+                continue
             room = cfg.max_per_side - exposure
             if room <= 0:
                 logger.info("  [maker] %s %d/%d at limit → skip", side, exposure, cfg.max_per_side)
                 continue
 
             # ── Imbalance guard: don't add to the heavy side ──
-            # In coupled pricing mode, the derived side (pair-completing order)
-            # would be blocked incorrectly — skip the guard.
-            if self.cfg.profit_target <= 0:
-                imbalance = abs(exposure_up - exposure_down)
-                if imbalance >= cfg.max_imbalance:
-                    heavy = "Up" if exposure_up > exposure_down else "Down"
-                    if side == heavy:
-                        logger.info("  [maker] %s skip: imbalance %d >= %d (expo U=%d D=%d)",
-                                    side, imbalance, cfg.max_imbalance,
-                                    exposure_up, exposure_down)
-                        continue
-                    # Light side: cap price to ensure pair cost ≤ max_pair_sum
-                    heavy_avg = ws.avg_cost_up if heavy == "Up" else ws.avg_cost_down
-                    max_light = cfg.max_pair_sum - heavy_avg
-                    if max_light > 0 and price > max_light:
-                        logger.info("  [maker] %s rebalance: price %.4f → %.4f (heavy_avg=%.4f, max_pair=%.4f)",
-                                    side, price, max_light, heavy_avg, cfg.max_pair_sum)
-                        price = max_light
+            # Tier 1: Filled-only — real directional risk
+            inv_imbalance = abs(inv_up - inv_down)
+            if inv_imbalance >= cfg.max_imbalance:
+                heavy = "Up" if inv_up > inv_down else "Down"
+                if side == heavy:
+                    logger.info("  [maker] %s skip: filled imbalance %d >= %d (inv U=%d D=%d)",
+                                side, inv_imbalance, cfg.max_imbalance,
+                                inv_up, inv_down)
+                    continue
+                # Light side: cap price to ensure pair cost ≤ max_pair_sum
+                heavy_avg = ws.avg_cost_up if heavy == "Up" else ws.avg_cost_down
+                max_light = cfg.max_pair_sum - heavy_avg
+                if max_light > 0 and price > max_light:
+                    logger.info("  [maker] %s rebalance: price %.4f → %.4f (heavy_avg=%.4f, max_pair=%.4f)",
+                                side, price, max_light, heavy_avg, cfg.max_pair_sum)
+                    price = max_light
+            # Tier 2: Exposure (filled+pending) — prevent pending from masking risk
+            exp_imbalance = abs(exposure_up - exposure_down)
+            if exp_imbalance >= cfg.max_imbalance:
+                heavy = "Up" if exposure_up > exposure_down else "Down"
+                if side == heavy:
+                    logger.info("  [maker] %s skip: exposure imbalance %d >= %d (expo U=%d D=%d)",
+                                side, exp_imbalance, cfg.max_imbalance,
+                                exposure_up, exposure_down)
+                    continue
+                # Light side: cap price to ensure pair cost ≤ max_pair_sum
+                heavy_avg = ws.avg_cost_up if heavy == "Up" else ws.avg_cost_down
+                max_light = cfg.max_pair_sum - heavy_avg
+                if max_light > 0 and price > max_light:
+                    logger.info("  [maker] %s rebalance: price %.4f → %.4f (heavy_avg=%.4f, max_pair=%.4f)",
+                                side, price, max_light, heavy_avg, cfg.max_pair_sum)
+                    price = max_light
 
-            # ── Marginal pair cost check ──
-            # Would filling this order push the average pair cost above
-            # max_pair_sum?  Skip if so — otherwise we lock in a guaranteed loss.
-            # In coupled pricing mode (profit_target > 0), every NEW pair
-            # costs exactly lead + derived = 1.0 - profit_target, independent
-            # of existing avg_cost.  Skip marginal check to avoid blocking
-            # the lead side when existing inventory happens to have a very
-            # different average cost (e.g. Up filled cheap, Down won't fill).
-            if self.cfg.profit_target > 0:
-                pass  # coupled pricing: new pairs always cost 1.0 - target
-            elif side == "Up" and ws.inventory["Down"] > 0:
-                marginal = price + ws.avg_cost_down
-                if marginal > cfg.max_pair_sum:
-                    logger.info(
-                        "  [maker] %s skip: marginal pair %.4f > %.4f "
-                        "(up=%.4f + avg_down=%.4f  inv Down=%d)",
-                        side, marginal, cfg.max_pair_sum,
-                        price, ws.avg_cost_down, ws.inventory["Down"],
-                    )
-                    continue
-            elif side == "Down" and ws.inventory["Up"] > 0:
-                marginal = ws.avg_cost_up + price
-                if marginal > cfg.max_pair_sum:
-                    logger.info(
-                        "  [maker] %s skip: marginal pair %.4f > %.4f "
-                        "(avg_up=%.4f + down=%.4f  inv Up=%d)",
-                        side, marginal, cfg.max_pair_sum,
-                        ws.avg_cost_up, price, ws.inventory["Up"],
-                    )
-                    continue
+
+            # ── Price proximity check (per-side, after all price mods) ──
+            # Check against the FINAL price (post rebalance cap), not the
+            # original engine price.  Prevents stacking at the same level.
+            too_close = any(
+                abs(po.price - price) < cfg.min_price_gap
+                for po in ws.pending_orders.values()
+                if po.side == side and po.cancelled_at == 0
+            )
+            if too_close:
+                logger.info(
+                    "  [maker] %s skip: price %.4f too close to pending (min_gap=%.4f)",
+                    side, price, cfg.min_price_gap,
+                )
+                continue
 
             qty = min(cfg.per_tick, room)
             if qty >= cfg.min_order_size:

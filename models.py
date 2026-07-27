@@ -268,8 +268,9 @@ class OrderFilled:
     window_num: int
     outcome: str
     price: float
-    amount: int
+    amount: int          # this fill size
     order_id: str = ""
+    total_filled: int = 0  # cumulative filled after this fill
     total_inv_up: int = 0
     total_inv_down: int = 0
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import traceback
 from typing import Optional
 
 from polymarket.clients.async_public import AsyncPublicClient
@@ -22,7 +23,8 @@ from polymarket.models.clob.market_events import (
     MarketLastTradePricePayload,
 )
 from polymarket.models.clob.order_book import OrderBook
-from polymarket.models.clob.order_response import AcceptedOrder, RejectedOrder
+from polymarket.models.clob.order_response import AcceptedOrder, OrderResponse, RejectedOrder
+from polymarket.models.clob.orders import SignedOrder
 from polymarket.streams._specs import MarketSpec as SdkMarketSpec
 
 from polymarket.streams._specs import UserSpec
@@ -379,12 +381,13 @@ class SdkClient:
         price = self.round_to_tick(price, tick_size)
         if price != price_raw:
             logger.info(
-                "  [sdk] Price rounded from %.6f to %.6f (tick=%.4f) token=%s…",
-                price_raw, price, tick_size, token_id[:12],
+                "  [sdk] Price rounded from %.6f to %.6f (tick=%.4f) token=%s",
+                price_raw, price, tick_size, token_id,
             )
         logger.info(
-            "  [sdk] place_limit_order  token=%s… side=%s price=%.4f size=%d",
-            token_id[:12], side, price, size,
+            "  [sdk] place_limit_order  token=%s side=%s price=%.6f size=%d "
+            "post_only=True tick=%.4f",
+            token_id, side, price, size, tick_size,
         )
         try:
             result = await self._secure.place_limit_order(
@@ -396,24 +399,27 @@ class SdkClient:
             )
             if isinstance(result, AcceptedOrder):
                 logger.info(
-                    "  [sdk] Order ACCEPTED  id=%s…  token=%s… price=%.4f size=%d",
-                    result.order_id[:12], token_id[:12], price, size,
+                    "  [sdk] Order ACCEPTED  id=%s  token=%s  price=%.6f size=%d",
+                    result.order_id, token_id, price, size,
                 )
                 return result.order_id
             if isinstance(result, RejectedOrder):
                 logger.warning(
                     "  [sdk] Order REJECTED: code=%s msg=%s "
-                    "token=%s… side=%s price=%.4f size=%d",
+                    "token=%s side=%s price=%.6f size=%d post_only=True",
                     result.code, result.message,
-                    token_id[:12], side, price, size,
+                    token_id, side, price, size,
                 )
                 return None
             # Fallback for unexpected response types
             logger.warning("  [sdk] Unexpected order response: %r", result)
             return None
         except Exception as e:
-            logger.warning("  [sdk] place_limit_order exception: %s  token=%s… price=%.4f size=%d",
-                           e, token_id[:12], price, size)
+            logger.warning(
+                "  [sdk] place_limit_order EXCEPTION: %s\n"
+                "    token=%s side=%s price=%.6f size=%d post_only=True\n%s",
+                e, token_id, side, price, size, traceback.format_exc(),
+            )
             return None
 
     async def cancel_order(self, order_id: str) -> bool:
@@ -490,6 +496,86 @@ class SdkClient:
         except Exception as e:
             logger.warning("get_open_orders failed: %s", e)
             return []
+
+    # ── Paired order submission ──
+
+    async def create_signed_limit_order(
+        self, token_id: str, side: str, price: float, size: int,
+        post_only: bool = True,
+    ) -> Optional[SignedOrder]:
+        """Create and sign a limit order without submitting.
+
+        Returns SignedOrder for batch submission via submit_orders().
+        Use when you want to submit multiple orders together (e.g. Up+Down pair).
+        """
+        if not self._secure:
+            logger.error("Cannot create signed order: no secure client")
+            return None
+        tick_size = await self.get_tick_size(token_id)
+        price_raw = price
+        price = self.round_to_tick(price, tick_size)
+        if price != price_raw:
+            logger.info(
+                "  [sdk] Signed order price rounded from %.6f to %.6f (tick=%.4f) token=%s",
+                price_raw, price, tick_size, token_id,
+            )
+        logger.info(
+            "  [sdk] create_signed_limit_order  token=%s side=%s price=%.6f size=%d "
+            "post_only=%s tick=%.4f",
+            token_id, side, price, size, post_only, tick_size,
+        )
+        try:
+            signed = await self._secure.create_limit_order(
+                token_id=token_id,
+                price=str(price),
+                size=str(size),
+                side=side,
+                post_only=post_only,
+            )
+            logger.info(
+                "  [sdk] Signed order created  token=%s side=%s price=%.6f size=%d",
+                token_id, side, price, size,
+            )
+            return signed
+        except Exception as e:
+            logger.warning(
+                "  [sdk] create_signed_limit_order EXCEPTION: %s\n"
+                "    token=%s side=%s price=%.6f size=%d post_only=%s",
+                e, token_id, side, price, size, post_only,
+            )
+            return None
+
+    async def submit_orders(self, signed_orders: list[SignedOrder]) -> list[Optional[str]]:
+        """Submit multiple signed orders together via post_orders.
+
+        Orders arrive at the CLOB in the same HTTP request, minimizing the
+        race window between them.  Returns a list of order_ids in the same
+        order as the input (None for rejected/failed orders).
+        """
+        if not self._secure:
+            logger.error("Cannot submit orders: no secure client")
+            return [None] * len(signed_orders)
+        logger.info("  [sdk] submit_orders: %d orders", len(signed_orders))
+        try:
+            responses: tuple[OrderResponse, ...] = await self._secure.post_orders(signed_orders)
+            results = []
+            for i, resp in enumerate(responses):
+                if isinstance(resp, AcceptedOrder):
+                    logger.info(
+                        "  [sdk] Order %d ACCEPTED  id=%s", i, resp.order_id,
+                    )
+                    results.append(resp.order_id)
+                else:
+                    code = getattr(resp, 'code', 'unknown')
+                    msg = getattr(resp, 'message', '')
+                    logger.warning(
+                        "  [sdk] Order %d REJECTED: code=%s msg=%s", i, code, msg,
+                    )
+                    results.append(None)
+            return results
+        except Exception as e:
+            logger.warning("  [sdk] submit_orders EXCEPTION: %s", e)
+            return [None] * len(signed_orders)
 
     # ── Cleanup ──
 

@@ -20,10 +20,10 @@ fi
 echo $$ > "$PIDFILE"
 trap 'rm -f "$PIDFILE"' EXIT INT TERM
 
-# ── Kill any stray poly_trader processes ──
-STRAYS=$(pgrep -f "python.*poly_trader" 2>/dev/null || true)
+# ── Kill stray poly_trader processes (only run mode, not check) ──
+STRAYS=$(pgrep -f "python.*poly_trader run" 2>/dev/null || true)
 if [ -n "$STRAYS" ]; then
-    echo "Killing stale poly_trader processes: $STRAYS"
+    echo "Killing stale poly_trader run processes: $STRAYS"
     kill $STRAYS 2>/dev/null || true
     sleep 1
 fi
@@ -32,11 +32,18 @@ echo "═══ Polymarket Temporal Arbitrage — Live Trading ═══"
 echo "  PID: $$"
 echo ""
 
-# Check credentials first
-python3 -m poly_trader check
+# Check credentials first — fail-fast if invalid
+echo "Checking credentials..."
+if ! python3 -m poly_trader check; then
+    echo "ERROR: Credential check failed — aborting"
+    exit 1
+fi
 
 echo ""
 echo "Starting live trading in 5s (Ctrl+C to abort)..."
 sleep 5
 
-exec python3 -m poly_trader run --market btc-updown-15m "$@"
+python3 -m poly_trader run --market btc-updown-15m "$@"
+
+# Clean up PID file on exit
+rm -f "$PIDFILE"

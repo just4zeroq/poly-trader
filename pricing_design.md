@@ -146,7 +146,6 @@ class Decision:
 | 约束 | 捡便宜者 | 配对者 |
 |------|---------|--------|
 | `max_per_side` | ✓ | ✓ |
-| `max_imbalance` (K) | ✓ 到达即停 | 不受限（始终运行） |
 | `min_remaining_time` | ✓ 300s 窗口尾禁挂 | 不受限 |
 | `max_pair_cost` (0.9999) | 不参与 | ✓ 硬条件过滤 lot |
 | `cancel_min_age` (30s) | ✓ | ✓ |
