@@ -100,6 +100,39 @@ class OrderExecutor:
                 return pair
         return None
 
+    def _pair_lots_in_same_pair(self, ws: WindowState, pair_id: str):
+        """Directly pair lots belonging to the same Pair, bypassing free_pair.
+
+        When a re-pair or new-pair order fills, both sides' lots share the
+        same pair_id.  Pair them immediately so free_pair doesn't accidentally
+        match them with unrelated lots.
+        """
+        up_lots = [l for l in ws.lots
+                   if l.side == "Up" and l.pair_id == pair_id and l.unpaired_qty > 0]
+        down_lots = [l for l in ws.lots
+                     if l.side == "Down" and l.pair_id == pair_id and l.unpaired_qty > 0]
+        if not up_lots or not down_lots:
+            return
+
+        # Pair cheapest first within the same pair
+        up_lots.sort(key=lambda l: l.price)
+        down_lots.sort(key=lambda l: l.price)
+        paired = 0
+        for ul in up_lots:
+            for dl in down_lots:
+                if ul.unpaired_qty <= 0 or dl.unpaired_qty <= 0:
+                    continue
+                pair_qty = min(ul.unpaired_qty, dl.unpaired_qty)
+                ul.paired_qty += pair_qty
+                dl.paired_qty += pair_qty
+                paired += pair_qty
+
+        if paired:
+            logger.info(
+                "  [pair_lots] pair=%s %d contracts paired within same pair",
+                pair_id, paired,
+            )
+
 
 class LiveExecutor(OrderExecutor):
     """Live trading — SDK place_limit_order + cancel_order."""
@@ -108,8 +141,9 @@ class LiveExecutor(OrderExecutor):
         super().__init__()
         # Orphan fill buffer: fills that arrived before pending_orders entry
         self._orphan_fills: dict[str, tuple] = {}
-        # Dedup set: skip historical fill replay on User WS reconnect
-        self._fill_seen: set[str] = set()
+        # Dedup dict: order_id → timestamp, skip historical fill replay on User WS reconnect
+        # Time-based pruning avoids catastrophic state loss from set.clear()
+        self._fill_seen: dict[str, float] = {}
 
     async def place(self, slug: str, token_id: str, outcome: str,
                     price: float, amount: int,
@@ -311,6 +345,9 @@ class LiveExecutor(OrderExecutor):
         with cancelled_at set, _handle_trade can still match it and correctly
         update inventory/cost.  flush_cancelled() removes them after the
         grace period.
+
+        Also cleans up the Pair object: clears the cancelled order_id so
+        Phase A re-pair won't reference a dead order.
         """
         ok = await self.engine.sdk.cancel_order(order_id)
         if ok:
@@ -319,6 +356,65 @@ class LiveExecutor(OrderExecutor):
                 if po is None:
                     continue
                 po.cancelled_at = time.time()
+
+                # Clear the cancelled order from its Pair
+                pair = self._find_pair_for_order(ws, order_id)
+                if pair:
+                    if pair.up_order_id == order_id:
+                        pair.up_order_id = ""
+                    elif pair.down_order_id == order_id:
+                        pair.down_order_id = ""
+
+                    # If the cancelled order never filled and the pair has
+                    # no real fills (just Phase B pre-fill), dissolve it
+                    # and reverse the pre-fill on heavy-side lots so they
+                    # re-enter the free-pairing pool.
+                    #
+                    # Phase B pre-fills exactly one side to qty.  Real fills
+                    # from _process_fill increment beyond qty or fill the
+                    # other side.  Checking for the exact pre-fill pattern
+                    # avoids dissolving a pair that has real fills from a
+                    # previous order (e.g. re-pair order cancelled after the
+                    # original order partially filled).
+                    prefill_only = (
+                        (pair.up_filled == pair.qty and pair.down_filled == 0)
+                        or (pair.down_filled == pair.qty and pair.up_filled == 0)
+                    )
+                    if po.filled == 0 and prefill_only:
+                        prefill_side = "Up" if pair.up_filled > 0 else "Down"
+                        prefill_amount = pair.up_filled if prefill_side == "Up" else pair.down_filled
+                        reversed_qty = 0
+                        remaining = prefill_amount
+                        for lot in ws.lots:
+                            if lot.pair_id == pair.pair_id and lot.side == prefill_side and remaining > 0:
+                                revert = min(lot.paired_qty, remaining)
+                                lot.paired_qty -= revert
+                                lot.pair_id = ""
+                                reversed_qty += revert
+                                remaining -= revert
+                        # Clear pair_id from any remaining lots on the other
+                        # side (shouldn't exist when prefill_only is true,
+                        # but belt-and-suspenders).
+                        for lot in ws.lots:
+                            if lot.pair_id == pair.pair_id:
+                                lot.pair_id = ""
+                        pair.up_filled = 0
+                        pair.down_filled = 0
+                        ws.pairs.remove(pair)
+                        logger.info(
+                            "  [cancel] Pair %s dissolved (order %s had no fills)  "
+                            "reversed %d paired_qty on %s side  unpaired: Up=%d Down=%d",
+                            pair.pair_id, order_id[:12], reversed_qty, prefill_side,
+                            sum(l.unpaired_qty for l in ws.lots if l.side == "Up"),
+                            sum(l.unpaired_qty for l in ws.lots if l.side == "Down"),
+                        )
+                    elif pair.up_filled == 0 and pair.down_filled == 0:
+                        ws.pairs.remove(pair)
+                        logger.info(
+                            "  [cancel] Pair %s dissolved (no fills on either side)",
+                            pair.pair_id,
+                        )
+
                 await self.engine._emit("order_cancelled", OrderCancelled(
                     window_num=ws.window_num,
                     outcome=po.side, amount=po.remaining,
@@ -338,9 +434,13 @@ class LiveExecutor(OrderExecutor):
         await asyncio.sleep(3)
         # Remove soft-deleted orders (grace=0 because we already waited above)
         await self.flush_cancelled(grace=0.0)
-        # Force-clear any stragglers (failed cancels that couldn't be soft-deleted)
-        for oid in list(pending_orders):
-            pending_orders.pop(oid, None)
+        # Keep any orders where cancel failed — they may still be live on CLOB
+        failed = [po for po in pending_orders.values() if po.cancelled_at == 0]
+        if failed:
+            logger.warning(
+                "  [cancel_all] %d orders could not be cancelled (still live on CLOB)",
+                len(failed),
+            )
 
     async def flush_cancelled(self, grace: float = 5.0):
         """Remove soft-deleted orders whose grace period has elapsed."""
@@ -381,6 +481,11 @@ class LiveExecutor(OrderExecutor):
 
         self._create_lot_and_pair(ws, po, actual, fill_price, pair_id=pair_id)
 
+        # If this fill completes a pair, directly pair lots within the same pair
+        # to avoid free_pair matching them with unrelated lots.
+        if pair and pair_id:
+            self._pair_lots_in_same_pair(ws, pair_id)
+
         remaining = po.amount - po.filled
         logger.info(
             "  [fill] %s %d @ %.4f  order=%s…  "
@@ -389,6 +494,27 @@ class LiveExecutor(OrderExecutor):
             ws.inventory["Up"], ws.inventory["Down"],
             remaining,
         )
+
+    # ── _fill_seen time-based pruning ──
+
+    def _prune_fill_seen(self, max_count: int = 10000, max_age: float = 960):
+        """Remove oldest entries when dict exceeds *max_count* or entries exceed *max_age*.
+
+        Keeps dedup coverage for the CLOB replay window (typically ≤5 min after
+        reconnect) while bounding memory.  Called on each new fill when the dict
+        grows past *max_count*.
+        """
+        now = time.time()
+        stale = [oid for oid, ts in self._fill_seen.items() if now - ts > max_age]
+        for oid in stale:
+            del self._fill_seen[oid]
+        if len(self._fill_seen) > max_count:
+            sorted_by_age = sorted(self._fill_seen.items(), key=lambda kv: kv[1])
+            for oid, _ in sorted_by_age[:len(self._fill_seen) - max_count]:
+                del self._fill_seen[oid]
+        if stale:
+            logger.info("  [fill] Pruned %d stale entries from _fill_seen  remaining=%d",
+                        len(stale), len(self._fill_seen))
 
     async def handle_user_event(self, event):
         """Process authenticated user channel events for fill tracking."""
@@ -415,9 +541,9 @@ class LiveExecutor(OrderExecutor):
             # Dedup: skip historical replay from User WS reconnect
             if oid in self._fill_seen:
                 continue
-            self._fill_seen.add(oid)
-            if len(self._fill_seen) > 2000:
-                self._fill_seen.clear()
+            self._fill_seen[oid] = time.time()
+            if len(self._fill_seen) > 10000:
+                self._prune_fill_seen()
 
             # Locate the pending order across all active windows
             found = False

@@ -9,15 +9,11 @@ Each tick:
 
 from __future__ import annotations
 import logging
-import time
 
 from .config import Config
 from .models import Decision, Pair, WindowState
 
 logger = logging.getLogger(__name__)
-
-PAIR_SIZE = 5  # contracts per side per pair
-
 
 class MakerStrategy:
     """Pair-first market making strategy."""
@@ -84,13 +80,11 @@ class MakerStrategy:
             return placed_pair
 
         # ════════════════════════════════════════════
-        # Step 3: Normal independent logic
+        # Step 3: New pair — normal market making
         # ════════════════════════════════════════════
         return self._step3_normal(
             ws, up_price, down_price,
-            unpaired_up, unpaired_down,
             unpaired_up_lots, unpaired_down_lots,
-            inv_up, inv_down,
             exposure_up, exposure_down,
         )
 
@@ -222,7 +216,7 @@ class MakerStrategy:
                 )
                 continue
 
-            qty = min(remaining, PAIR_SIZE, room)
+            qty = min(remaining, cfg.min_order_size, room)
             if qty >= cfg.min_order_size:
                 logger.info(
                     "  [re-pair] %s %d @ %.4f (pair=%s, remaining=%d)",
@@ -311,7 +305,7 @@ class MakerStrategy:
             return None
 
         # Place order
-        qty = min(PAIR_SIZE, room)
+        qty = min(cfg.min_order_size, room)
         if qty >= cfg.min_order_size:
             logger.info(
                 "  [pair_order] %s %d @ %.4f (heavy=%s avg=%.4f need=%d)",
@@ -323,9 +317,29 @@ class MakerStrategy:
                 pair_id=f"pair_{ws.window_num}_{len(ws.pairs)}",
                 up_price=up_price if pair_side == "Up" else avg_heavy,
                 down_price=down_price if pair_side == "Down" else avg_heavy,
-                qty=PAIR_SIZE,
+                qty=cfg.min_order_size,
             )
             ws.pairs.append(pair)
+
+            # Pre-fill the heavy side — these lots already exist in inventory.
+            # Without this, the Pair would show "pending_side=heavy_side" after the
+            # light side fills, triggering a false re-pair that buys more on the
+            # heavy side (net new position, not pairing).
+            if pair_side == "Down":
+                pair.up_filled = qty  # existing Up lots are pre-paired
+            else:
+                pair.down_filled = qty  # existing Down lots are pre-paired
+            # Update the heavy lots so _pair_lots_in_same_pair and _free_pair
+            # see them as already paired.
+            remaining = qty
+            for lot in heavy_lots:
+                if remaining <= 0:
+                    break
+                match = min(lot.unpaired_qty, remaining)
+                if match > 0:
+                    lot.paired_qty += match
+                    lot.pair_id = pair.pair_id
+                    remaining -= match
 
             return [Decision(side=pair_side, amount=qty, price=price, pair_id=pair.pair_id)]
 
@@ -336,110 +350,71 @@ class MakerStrategy:
         return None
 
     # ──────────────────────────────────────────────
-    # Step 3: Normal independent logic
+    # Step 3: New pair — normal market making
     # ──────────────────────────────────────────────
 
     def _step3_normal(
         self, ws: WindowState,
         up_price: float, down_price: float,
-        unpaired_up: int, unpaired_down: int,
         unpaired_up_lots: list, unpaired_down_lots: list,
-        inv_up: int, inv_down: int,
         exposure_up: int, exposure_down: int,
     ) -> list[Decision]:
-        """Normal independent Up/Down orders, with guards.
+        """Open a fresh Up+Down pair when backlog is manageable.
 
-        Only runs when step 2 did NOT place a pair order.
-        Room check: reserve space for future pairing before normal logic.
+        Only runs when step 2 did NOT place a pair order (e.g. prices too high
+        for profitable pairing, or no imbalance to fix).
+
+        Unlike step 2 (which fixes existing imbalance), step 3 keeps orders
+        flowing by opening new symmetrical pairs — but only when the unpaired
+        backlog is small enough that new orders won't make it worse.
+
+        Guards:
+          - Backlog: max(unpaired lots) < max_unpaired_backlog
+          - Pair cost: up_price + down_price <= pair_cost_max
+          - Both sides have room for min_order_size
         """
         decisions: list[Decision] = []
         cfg = self.cfg
 
-        # ── Room check: reserve space for future pairing ──
-        needed_pairs = max(
+        # ── Backlog check ──
+        backlog = max(
             len([l for l in unpaired_up_lots if l.unpaired_qty > 0]),
             len([l for l in unpaired_down_lots if l.unpaired_qty > 0]),
         )
-        if needed_pairs > 0:
-            up_needed = exposure_up + needed_pairs * PAIR_SIZE
-            down_needed = exposure_down + needed_pairs * PAIR_SIZE
-            if up_needed > cfg.max_per_side or down_needed > cfg.max_per_side:
-                logger.info(
-                    "  [step3] Room check: need %d pairs → Up=%d/%d Down=%d/%d  skip tick",
-                    needed_pairs, up_needed, cfg.max_per_side,
-                    down_needed, cfg.max_per_side,
-                )
-                return decisions
-
-        # ── Atomic pre-check: either side too close → skip both ──
-        for side, price in [("Up", up_price), ("Down", down_price)]:
-            if price <= 0:
-                continue
-            too_close = any(
-                abs(po.price - price) < cfg.min_price_gap
-                for po in ws.pending_orders.values()
-                if po.side == side and po.cancelled_at == 0
+        if backlog >= cfg.max_unpaired_backlog:
+            logger.info(
+                "  [step3] Backlog %d >= %d → skip (wait for pairing)",
+                backlog, cfg.max_unpaired_backlog,
             )
-            if too_close:
-                logger.info(
-                    "  [step3] Atomic skip: %s price %.4f too close to pending "
-                    "(min_gap=%.4f) → skip both sides",
-                    side, price, cfg.min_price_gap,
-                )
-                return decisions
+            return decisions
 
-        # ── Imbalance: tier 1 (filled) ──
-        inv_imbalance = abs(inv_up - inv_down)
-        inv_heavy = "Up" if inv_up > inv_down else "Down"
-
-        # ── Imbalance: tier 2 (filled + pending) ──
-        exp_imbalance = abs(exposure_up - exposure_down)
-        exp_heavy = "Up" if exposure_up > exposure_down else "Down"
-
-        for side, price, exposure in [
-            ("Up", up_price, exposure_up),
-            ("Down", down_price, exposure_down),
-        ]:
-            if price <= 0:
-                continue
-
-            # Room check
-            room = cfg.max_per_side - exposure
-            if room <= 0:
-                logger.info("  [step3] %s %d/%d at limit → skip", side, exposure, cfg.max_per_side)
-                continue
-
-            # Imbalance guard tier 1 (filled)
-            if inv_imbalance >= cfg.max_imbalance and side == inv_heavy:
-                logger.info(
-                    "  [step3] %s skip: filled imbalance %d >= %d (inv U=%d D=%d)",
-                    side, inv_imbalance, cfg.max_imbalance, inv_up, inv_down,
-                )
-                continue
-
-            # Imbalance guard tier 2 (filled + pending)
-            if exp_imbalance >= cfg.max_imbalance and side == exp_heavy:
-                logger.info(
-                    "  [step3] %s skip: exposure imbalance %d >= %d (expo U=%d D=%d)",
-                    side, exp_imbalance, cfg.max_imbalance, exposure_up, exposure_down,
-                )
-                continue
-
-            # Per-side min_gap
-            too_close = any(
-                abs(po.price - price) < cfg.min_price_gap
-                for po in ws.pending_orders.values()
-                if po.side == side and po.cancelled_at == 0
+        # ── Pair cost check ──
+        if up_price + down_price > cfg.pair_cost_max:
+            logger.info(
+                "  [step3] Pair cost %.4f > %.2f → skip",
+                up_price + down_price, cfg.pair_cost_max,
             )
-            if too_close:
-                logger.info(
-                    "  [step3] %s skip: price %.4f too close to pending (min_gap=%.4f)",
-                    side, price, cfg.min_price_gap,
-                )
-                continue
+            return decisions
 
-            qty = min(PAIR_SIZE, room)
-            if qty >= cfg.min_order_size:
-                decisions.append(Decision(side=side, amount=qty, price=price))
+        # ── Room check: both sides need space ──
+        room_up = cfg.max_per_side - exposure_up
+        room_down = cfg.max_per_side - exposure_down
+        if room_up < cfg.min_order_size or room_down < cfg.min_order_size:
+            logger.info(
+                "  [step3] Room insufficient: Up=%d/%d Down=%d/%d → skip",
+                exposure_up, cfg.max_per_side, exposure_down, cfg.max_per_side,
+            )
+            return decisions
 
+        qty = min(cfg.min_order_size, room_up, room_down)
+        if qty < cfg.min_order_size:
+            return decisions
+
+        decisions.append(Decision(side="Up", amount=qty, price=up_price))
+        decisions.append(Decision(side="Down", amount=qty, price=down_price))
+
+        logger.info(
+            "  [step3] New pair  Up=%d@%.4f  Down=%d@%.4f  backlog=%d",
+            qty, up_price, qty, down_price, backlog,
+        )
         return decisions
