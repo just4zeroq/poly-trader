@@ -115,6 +115,7 @@ class Lot:
     amount: int       # original fill size
     price: float      # fill price
     paired_qty: int = 0
+    pair_id: str = ""  # links to Pair.pair_id when paired
     created_at: float = 0.0
 
     @property
@@ -132,6 +133,40 @@ class Decision:
     side: str      # "Up" / "Down"
     amount: int    # order size
     price: float   # maker limit price
+    pair_id: str = ""  # links to Pair.pair_id (for order ID tracking in executor)
+
+
+@dataclass
+class Pair:
+    """A linked Up+Down pair — created when strategy places a new pair order.
+
+    Both sides use the same qty.  Cost is locked at creation time.
+    """
+    pair_id: str
+    up_price: float
+    down_price: float
+    qty: int = 5
+    up_order_id: str = ""
+    down_order_id: str = ""
+    up_filled: int = 0
+    down_filled: int = 0
+
+    @property
+    def cost(self) -> float:
+        return self.up_price + self.down_price
+
+    @property
+    def is_complete(self) -> bool:
+        return self.up_filled >= self.qty and self.down_filled >= self.qty
+
+    @property
+    def pending_side(self) -> Optional[str]:
+        """Return the side that still needs filling, or None."""
+        if self.up_filled >= self.qty and self.down_filled < self.qty:
+            return "Down"
+        if self.down_filled >= self.qty and self.up_filled < self.qty:
+            return "Up"
+        return None
 
 
 @dataclass
@@ -179,6 +214,7 @@ class WindowState:
     trades: int = 0
     pending_orders: dict[str, PendingOrder] = field(default_factory=dict)
     lots: list = field(default_factory=list)  # list[Lot] — per-fill records for pairing
+    pairs: list = field(default_factory=list)  # list[Pair] — active pairs for this window
 
     @property
     def avg_cost_up(self) -> float:

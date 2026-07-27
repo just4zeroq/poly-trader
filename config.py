@@ -75,16 +75,13 @@ class Config:
     wallet_address: str = field(default_factory=lambda: _env("wallet_address"))
 
     # ── Strategy ──
-    profit_target: float = field(default_factory=lambda: _env_float("profit_target", 0.01))
-    """Coupled pricing profit target. 0 = disabled (independent pricing).
-    When > 0 (e.g. 0.03), lead side is priced at maker, derived side =
-    1.0 - lead_price - profit_target, guaranteeing profit per new pair."""
-    per_tick: int = field(default_factory=lambda: _env_int("per_tick", 5))
+    pair_cost_max: float = field(default_factory=lambda: _env_float("pair_cost_max", 1.0))
+    """Max cost for a paired order (up_price + down_price). New pairs and re-pairs
+    skip when cost exceeds this threshold.  1.0 = break-even."""
     max_per_side: int = field(default_factory=lambda: _env_int("max_per_side", 20))
     aggressiveness: float = field(default_factory=lambda: _env_float("aggressiveness", 0.3))
     """Aggressiveness 0-1 — higher = more aggressive pricing (closer to best_ask)."""
     cancel_replace_threshold: float = field(default_factory=lambda: _env_float("cancel_replace_threshold", 10.0))
-    max_pair_sum: float = field(default_factory=lambda: _env_float("max_pair_sum", 0.97))
     min_price_gap: float = field(default_factory=lambda: _env_float("min_price_gap", 0.02))
     """Minimum price gap to place another order on the same side. If the current tick's
     maker price is within this distance of any existing pending order, skip that side.
@@ -101,11 +98,8 @@ class Config:
     max_price_dev: float = field(default_factory=lambda: _env_float("max_price_dev", 0.20))
     max_extreme_price: float = field(default_factory=lambda: _env_float("max_extreme_price", 0.90))
     """Skip tick if either side's best_bid exceeds this (market is already settled)."""
-    min_pair_cost_fills: int = field(default_factory=lambda: _env_int("min_pair_cost_fills", 2))
     max_imbalance: int = field(default_factory=lambda: _env_int("max_imbalance", 10))
     """When the difference between Up and Down inventory exceeds this, stop adding to the heavy side."""
-    kill_pnl_per_pair: float = field(default_factory=lambda: _env_float("kill_pnl_per_pair", 0.03))
-    """Stop adding when guaranteed_pnl < -pairs × this (imbalance damage threshold)."""
     max_drawdown: float = field(default_factory=lambda: _env_float("max_drawdown", -5.0))
     stop_on_window_loss: bool = field(default_factory=lambda: _env_bool("stop_on_window_loss", True))
 

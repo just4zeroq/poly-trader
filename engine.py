@@ -636,6 +636,7 @@ class TradingEngine:
         consecutive_failures = 0
         idle_log_ts = 0.0
         no_price_log_ts = 0.0
+        tick_count = 0
         while self._running:
             now = time.time()
             remaining = window_end - now
@@ -646,10 +647,11 @@ class TradingEngine:
 
             # Throttle: minimum interval between ticks (default 1s)
             now = time.time()
-            min_gap = self.cfg.min_tick_interval
-            if now - self._last_tick_time < min_gap:
+            if now - self._last_tick_time < self.cfg.min_tick_interval:
                 continue
-            self._last_tick_time = now
+
+            t_wake = now
+            tick_count += 1
 
             # Round to tick size (before price validation)
             up_tick = await self.sdk.get_tick_size(market.up_token_id)
@@ -661,6 +663,8 @@ class TradingEngine:
                 up_tick, down_tick,
                 ws_state=ws_state,
             )
+            t_priced = time.time()
+
             if not up_price and not down_price:
                 if time.time() - no_price_log_ts > 30:
                     up_snap = self.prices.get(market.up_token_id)
@@ -676,30 +680,6 @@ class TradingEngine:
                     no_price_log_ts = time.time()
                 continue
 
-            # Kill-switch: stop adding when guaranteed PnL is too negative
-            if ws_state.trades >= self.cfg.min_pair_cost_fills and ws_state.guaranteed_pairs > 0:
-                if ws_state.guaranteed_pnl < -ws_state.guaranteed_pairs * self.cfg.kill_pnl_per_pair:
-                    up_pending = sum(1 for po in ws_state.pending_orders.values()
-                                     if po.side == "Up" and po.cancelled_at == 0)
-                    down_pending = sum(1 for po in ws_state.pending_orders.values()
-                                       if po.side == "Down" and po.cancelled_at == 0)
-                    logger.info(
-                        "[%s] Kill-switch: g_pnl=%.2f < "
-                        "-%d×%.2f=%.2f  inv=(U=%d/D=%d) pending=(U=%d/D=%d) pairs=%d",
-                        market.slug,
-                        ws_state.guaranteed_pnl,
-                        ws_state.guaranteed_pairs,
-                        self.cfg.kill_pnl_per_pair,
-                        -ws_state.guaranteed_pairs * self.cfg.kill_pnl_per_pair,
-                        ws_state.inventory["Up"], ws_state.inventory["Down"],
-                        up_pending, down_pending,
-                        ws_state.guaranteed_pairs,
-                    )
-                    await self.executor.cancel_all(ws_state.pending_orders)
-                    ws_state.pending_orders.clear()
-                    await asyncio.sleep(max(0.0, window_end - time.time() - 1))
-                    break
-
             # Cancel-replace: reprice stale pending orders
             await self.executor.flush_cancelled()
             await self._cancel_stale_pending(ws_state, up_price, down_price)
@@ -708,6 +688,7 @@ class TradingEngine:
                 ws_state, up_price, down_price,
                 remaining_time=remaining,
             )
+            t_decided = time.time()
 
             # Summarise decisions for tick event
             up_buy = sum(d.amount for d in decisions if d.side == "Up")
@@ -739,6 +720,12 @@ class TradingEngine:
                 )
                 idle_log_ts = now
 
+            t_emitted = time.time()
+
+            # Mark tick completion time for throttle (idle path — no orders placed)
+            if not decisions:
+                self._last_tick_time = time.time()
+
             # ── Place orders — batch pair when both sides ──
             if decisions:
                 # Log pending order state for anomaly detection
@@ -768,9 +755,29 @@ class TradingEngine:
                 # Single side → use existing individual placement
                 for d in decisions:
                     token_id = market.up_token_id if d.side == "Up" else market.down_token_id
-                    ok = await self._place_order(market.slug, token_id, d.side, d.price, d.amount)
+                    ok = await self._place_order(market.slug, token_id, d.side, d.price, d.amount, pair_id=d.pair_id)
                     if ok:
                         tick_any_ok = True
+
+            t_placed = time.time()
+
+            # Mark tick completion for throttle (busy path — orders placed)
+            if decisions:
+                self._last_tick_time = time.time()
+
+            # ── Tick timing summary (every tick, compact single-line) ──
+            dt_price  = (t_priced   - t_wake)    * 1000  # pricing phase (tick_size + resolve)
+            dt_decide = (t_decided  - t_priced)   * 1000  # cancel-replace + strategy
+            dt_emit   = (t_emitted  - t_decided)  * 1000  # event emit / idle log
+            dt_place  = (t_placed   - t_emitted)  * 1000  # order placement
+            dt_total  = (t_placed   - t_wake)     * 1000  # total tick wall-clock
+            logger.info(
+                "  ⏱ tick#%d total=%.1fms (price=%.1fms decide=%.1fms emit=%.1fms place=%.1fms) "
+                "decisions=%d pending=%d inv=U%d/D%d",
+                tick_count, dt_total, dt_price, dt_decide, dt_emit, dt_place,
+                len(decisions), len(ws_state.pending_orders),
+                ws_state.inventory["Up"], ws_state.inventory["Down"],
+            )
 
             # ── Consecutive failure → idle (likely out of balance) ──
             if decisions:
@@ -786,11 +793,6 @@ class TradingEngine:
                         )
                         await asyncio.sleep(max(0.0, window_end - time.time() - 1))
                         break
-
-            if ws_state.is_full(self.cfg.max_per_side):
-                logger.info("[%s] Both sides full → idle until window end", market.slug)
-                await asyncio.sleep(max(0.0, window_end - time.time() - 1))
-                break
 
         # ── settlement ──
         pnl = await self._settle_window(win_num, ws_state, market)
@@ -853,86 +855,6 @@ class TradingEngine:
                         slug, down_snap.best_bid, self.cfg.max_extreme_price)
             return None, None
 
-        # ── Coupled pricing (profit target mode) ──
-        profit_target = self.cfg.profit_target
-        if profit_target > 0 and ws_state is not None:
-            inv_up = ws_state.inventory["Up"]
-            inv_down = ws_state.inventory["Down"]
-
-            # Compute raw maker prices for both sides
-            up_raw = self._maker_price(up_snap)
-            down_raw = self._maker_price(down_snap)
-
-            # Lead = side with LESS inventory; tie → cheaper side
-            if inv_up < inv_down:
-                lead_side = "Up"
-            elif inv_down < inv_up:
-                lead_side = "Down"
-            else:
-                lead_side = "Up" if up_raw <= down_raw else "Down"
-
-            if lead_side == "Up":
-                raw = up_raw
-                up_price = self.sdk.round_to_tick(raw, up_tick)
-                target = 0.02 if 0.30 <= raw <= 0.70 else 0.01
-                # Derived side: use best_bid if it already meets profit target
-                opp_bid = down_snap.best_bid
-                if opp_bid and 1.0 - up_price - opp_bid >= target:
-                    down_price = opp_bid
-                    logger.info("[%s] Coupled: best_bid Down=%.4f profit=%.4f >= target=%.2f → use bid",
-                                slug, down_price, 1.0 - up_price - down_price, target)
-                elif opp_bid:
-                    if 1.0 - up_price - opp_bid < 0:
-                        logger.info("[%s] Coupled: Up=%.4f + Down bid=%.4f = %.4f > 1.0 → skip",
-                                    slug, up_price, opp_bid, up_price + opp_bid)
-                        return None, None
-                    # Can't meet target, but still place at best_bid for pairing
-                    down_price = opp_bid
-                    logger.info("[%s] Coupled: Down=bid=%.4f profit=%.4f < target=%.2f (place anyway for pairing)",
-                                slug, down_price, 1.0 - up_price - down_price, target)
-                else:
-                    down_raw_price = 1.0 - up_price - target
-                    down_price = self.sdk.round_to_tick(down_raw_price, down_tick)
-            else:
-                raw = down_raw
-                down_price = self.sdk.round_to_tick(raw, down_tick)
-                target = 0.02 if 0.30 <= raw <= 0.70 else 0.01
-                opp_bid = up_snap.best_bid
-                if opp_bid and 1.0 - down_price - opp_bid >= target:
-                    up_price = opp_bid
-                    logger.info("[%s] Coupled: best_bid Up=%.4f profit=%.4f >= target=%.2f → use bid",
-                                slug, up_price, 1.0 - down_price - up_price, target)
-                elif opp_bid:
-                    if 1.0 - down_price - opp_bid < 0:
-                        logger.info("[%s] Coupled: Down=%.4f + Up bid=%.4f = %.4f > 1.0 → skip",
-                                    slug, down_price, opp_bid, down_price + opp_bid)
-                        return None, None
-                    # Can't meet target, but still place at best_bid for pairing
-                    up_price = opp_bid
-                    logger.info("[%s] Coupled: Up=bid=%.4f profit=%.4f < target=%.2f (place anyway for pairing)",
-                                slug, up_price, 1.0 - down_price - up_price, target)
-                else:
-                    up_raw_price = 1.0 - down_price - target
-                    up_price = self.sdk.round_to_tick(up_raw_price, up_tick)
-
-            # One side must be valid
-            if up_price <= 0 and down_price <= 0:
-                logger.info("[%s] Coupled: both sides invalid → skip", slug)
-                return None, None
-
-            total = up_price + down_price
-            if up_price > 0 and down_price > 0:
-                logger.info(
-                    "[%s] Coupled pair: lead=%s target=%.2f sum=%.4f → Up=%.4f Down=%.4f",
-                    slug, lead_side, target, total, up_price, down_price,
-                )
-            else:
-                solo_side = "Up" if up_price > 0 else "Down"
-                logger.info(
-                    "[%s] Coupled solo: lead=%s target=%.2f → %s=%.4f",
-                    slug, lead_side, target, solo_side, up_price if up_price > 0 else down_price,
-                )
-        else:
             # ── Standard independent pricing ──
             up_price = self._maker_price(up_snap)
             down_price = self._maker_price(down_snap)
@@ -985,9 +907,11 @@ class TradingEngine:
     # ── Order execution ──
 
     async def _place_order(self, slug: str, token_id: str, outcome: str,
-                           price: float, amount: int) -> bool:
+                           price: float, amount: int,
+                           pair_id: str = "") -> bool:
         oid = await self.executor.place(
             slug, token_id, outcome, price, amount,
+            pair_id=pair_id,
         )
         return oid is not None
 

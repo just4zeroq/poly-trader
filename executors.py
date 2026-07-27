@@ -24,6 +24,7 @@ from .models import (
     OrderFilled,
     OrderFailed,
     OrderPlaced,
+    Pair,
     PendingOrder,
     WindowState,
 )
@@ -71,46 +72,33 @@ class OrderExecutor:
         pass
 
     def _create_lot_and_pair(self, ws: WindowState, po: PendingOrder,
-                              fill_size: int, fill_price: float):
-        """Create a Lot for this fill and pair with any unpaired opposite-side lot."""
+                              fill_size: int, fill_price: float,
+                              pair_id: str = ""):
+        """Create a Lot for this fill (pairing done by strategy.free_pair)."""
         lot_id = f"lot_{ws.window_num}_{po.side}_{len(ws.lots)}"
         lot = Lot(
             lot_id=lot_id, side=po.side,
             amount=fill_size, price=fill_price,
-            paired_qty=0, created_at=time.time(),
+            paired_qty=0, pair_id=pair_id,
+            created_at=time.time(),
         )
         ws.lots.append(lot)
+        logger.info(
+            "  [fill] %s lot=%s (%d @ %.4f)  pair=%s  "
+            "inv=(U=%d/D=%d) unpaired: Up=%d Down=%d",
+            po.side, lot_id, fill_size, fill_price,
+            pair_id or "none",
+            ws.inventory["Up"], ws.inventory["Down"],
+            sum(l.unpaired_qty for l in ws.lots if l.side == "Up"),
+            sum(l.unpaired_qty for l in ws.lots if l.side == "Down"),
+        )
 
-        # Generic pairing: find any unpaired opposite-side lot
-        opp_side = "Down" if po.side == "Up" else "Up"
-        paired_with = None
-        for existing in ws.lots:
-            if (existing is not lot
-                    and existing.side == opp_side
-                    and existing.unpaired_qty > 0):
-                capped = min(fill_size, existing.unpaired_qty)
-                existing.paired_qty += capped
-                lot.paired_qty += capped
-                paired_with = existing.lot_id
-                break
-
-        if paired_with:
-            logger.info(
-                "  [pair] %s lot=%s paired %d/%d with %s  "
-                "unpaired remaining: Up=%d Down=%d",
-                po.side, lot_id, lot.paired_qty, lot.amount,
-                paired_with,
-                sum(l.unpaired_qty for l in ws.lots if l.side == "Up"),
-                sum(l.unpaired_qty for l in ws.lots if l.side == "Down"),
-            )
-        else:
-            logger.info(
-                "  [pair] %s lot=%s (%d @ %.4f) UNPAIRED — no opposite-side open lot  "
-                "unpaired: Up=%d Down=%d",
-                po.side, lot_id, fill_size, fill_price,
-                sum(l.unpaired_qty for l in ws.lots if l.side == "Up"),
-                sum(l.unpaired_qty for l in ws.lots if l.side == "Down"),
-            )
+    def _find_pair_for_order(self, ws: WindowState, order_id: str) -> Optional[Pair]:
+        """Find the Pair that contains this order ID, if any."""
+        for pair in ws.pairs:
+            if order_id in (pair.up_order_id, pair.down_order_id):
+                return pair
+        return None
 
 
 class LiveExecutor(OrderExecutor):
@@ -124,7 +112,8 @@ class LiveExecutor(OrderExecutor):
         self._fill_seen: set[str] = set()
 
     async def place(self, slug: str, token_id: str, outcome: str,
-                    price: float, amount: int) -> Optional[str]:
+                    price: float, amount: int,
+                    pair_id: str = "") -> Optional[str]:
         ws = self.engine._windows.get(slug)
         if ws is None:
             return None
@@ -133,10 +122,11 @@ class LiveExecutor(OrderExecutor):
         side_pending = sum(1 for po in ws.pending_orders.values()
                           if po.side == outcome and po.cancelled_at == 0)
         logger.info(
-            "  [place] %s %d @ %.4f  side_pending=%d  inv=(U=%d/D=%d)",
+            "  [place] %s %d @ %.4f  side_pending=%d  inv=(U=%d/D=%d)  pair=%s",
             outcome, amount, price,
             side_pending,
             ws.inventory["Up"], ws.inventory["Down"],
+            pair_id or "-",
         )
 
         oid = await self.engine.sdk.place_limit_order(
@@ -156,6 +146,16 @@ class LiveExecutor(OrderExecutor):
                 price=price, amount=amount,
                 order_id=oid,
             ))
+
+            # Link to pair if this is a pair order
+            if pair_id:
+                for pair in ws.pairs:
+                    if pair.pair_id == pair_id:
+                        if outcome == "Up":
+                            pair.up_order_id = oid
+                        else:
+                            pair.down_order_id = oid
+                        break
 
             # Check if a fill for this order arrived before we registered it
             orphan = self._orphan_fills.pop(oid, None)
@@ -353,7 +353,7 @@ class LiveExecutor(OrderExecutor):
 
     def _process_fill(self, ws: WindowState, po: PendingOrder,
                       fill_size: int, fill_price: float):
-        """Apply a fill to a pending order (shared by _handle_trade and orphan replay)."""
+        """Apply a fill to a pending order and update pair tracking."""
         actual = min(fill_size, po.remaining)
         if actual <= 0:
             return
@@ -369,7 +369,17 @@ class LiveExecutor(OrderExecutor):
         ws.total_spent += actual * fill_price
         ws.trades += 1
 
-        self._create_lot_and_pair(ws, po, actual, fill_price)
+        # Find which pair this order belongs to, if any
+        pair_id = ""
+        pair = self._find_pair_for_order(ws, po.order_id)
+        if pair:
+            if po.order_id == pair.up_order_id:
+                pair.up_filled += actual
+            else:
+                pair.down_filled += actual
+            pair_id = pair.pair_id
+
+        self._create_lot_and_pair(ws, po, actual, fill_price, pair_id=pair_id)
 
         remaining = po.amount - po.filled
         logger.info(
