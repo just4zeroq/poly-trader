@@ -15,13 +15,13 @@ poly_trader/
 │   ├── strategy.py            Pair-first maker strategy (V3)
 │   ├── executors.py           LiveExecutor — real Polymarket orders + user WS fill tracking
 │   ├── models.py              Data models — MarketInfo, WindowState, OrderBookSnapshot, Pair
-│   ├── gamma_discovery.py     Gamma API market discovery
-│   └── run_info.py            Market info query tool
 ├── tools/
 │   ├── polymarket/            Polymarket-specific tooling
 │   │   ├── client.py          SDK wrapper — market discovery, WS subscribe, order placement
 │   │   ├── balance.py         Account balance & portfolio snapshot
-│   │   └── deposit.py         USDC.e deposit to CLOB
+│   │   ├── deposit.py         USDC.e deposit to CLOB
+│   │   ├── gamma_discovery.py Gamma API market discovery (programmatic)
+│   │   └── run_info.py        Market info query tool (Gamma API CLI)
 │   └── onchain/               On-chain operations
 │       ├── settle.py          Position settlement & redemption
 │       └── check_balance.py   Quick USDC balance check

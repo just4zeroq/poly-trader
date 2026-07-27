@@ -5,7 +5,7 @@ Queries ``gamma-api.polymarket.com/events`` by slug to find the currently
 active market windows.
 
 Usage::
-    from poly_trader.gamma_discovery import discover_markets
+    from poly_trader.tools.polymarket.gamma_discovery import discover_markets
 
     results = await discover_markets([MarketSpec("BTC", 5, "btc-updown-5m")])
     # → [{"condition_id": ..., "slug": ..., "tokens": [...], ...}]
@@ -20,9 +20,9 @@ from typing import Optional
 
 import aiohttp
 
-from .models import MarketSpec
+from ...platform.models import MarketSpec
 
-logger = logging.getLogger("poly_trader.gamma")
+logger = logging.getLogger("poly_trader.tools.polymarket.gamma_discovery")
 
 # Gamma API base URL
 GAMMA_API = "https://gamma-api.polymarket.com"
