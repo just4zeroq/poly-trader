@@ -89,7 +89,7 @@ async def async_main(args: argparse.Namespace):
 
 async def check_credentials(cfg: Config):
     """Verify Polymarket credentials work. Exits with 1 on failure."""
-    from .client import SdkClient
+    from ..tools.polymarket.client import SdkClient
 
     ok = True
 

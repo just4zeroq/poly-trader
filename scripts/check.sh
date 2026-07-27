@@ -9,4 +9,4 @@ echo ""
 
 python3 -m poly_trader check
 echo ""
-python3 -m poly_trader.check_balance
+python3 -m poly_trader.tools.onchain.check_balance

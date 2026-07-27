@@ -17,7 +17,7 @@ from web3 import Web3
 from polymarket.calls import MAX_UINT256, TransactionCall
 from polymarket.types import HexString
 
-from .config import Config
+from ...platform.config import Config
 from .client import SdkClient
 
 # Polygon RPC (read-only checks only — writes go through SDK)

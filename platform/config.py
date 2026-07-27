@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from .models import MarketSpec
 
 # Load .env beside this file (also tries CWD and parents)
-_env_path = Path(__file__).parent / ".env"
+_env_path = Path(__file__).resolve().parent.parent / ".env"
 if _env_path.exists():
     load_dotenv(_env_path, override=False)
 else:

@@ -18,9 +18,9 @@ async def fetch_trades(market_id: str, start_ts: int, end_ts: int, limit: int = 
 async def main():
     import sys
     sys.path.insert(0, "/home/ubuntu/code")
-    from poly_trader.client import SdkClient
-    from poly_trader.config import Config
-    from poly_trader.main import parse_market_spec
+    from poly_trader.tools.polymarket.client import SdkClient
+    from poly_trader.platform.config import Config
+    from poly_trader.platform.main import parse_market_spec
 
     cfg = Config()
     spec = parse_market_spec("btc-updown-15m")
