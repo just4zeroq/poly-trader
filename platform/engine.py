@@ -391,10 +391,6 @@ class TradingEngine:
         # Create secure client for live trading
         await self.sdk.create_secure(self.cfg)
 
-        # Cancel any lingering orders from a previous instance
-        if self.sdk.is_secure:
-            await self.sdk.cancel_all_open_orders()
-
         db_path = f"poly_trader_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
         self._sqlite = SqliteRecorder(self, db_path)
         logger.info("SQLite log: %s", db_path)
@@ -614,6 +610,10 @@ class TradingEngine:
             up_token_id=market.up_token_id,
             down_token_id=market.down_token_id,
         ))
+
+        # Cancel lingering orders from a previous instance (scoped to this market)
+        if self.sdk.is_secure and market.condition_id:
+            await self.sdk.cancel_all_open_orders(market=market.condition_id)
 
         # ── Restore current positions (engine restart mid-window) ──
         state = await self.sdk.load_current_state(market)
@@ -855,18 +855,18 @@ class TradingEngine:
                         slug, down_snap.best_bid, self.cfg.max_extreme_price)
             return None, None
 
-            # ── Standard independent pricing ──
-            up_price = self._maker_price(up_snap)
-            down_price = self._maker_price(down_snap)
-            up_price = self.sdk.round_to_tick(up_price, up_tick)
-            down_price = self.sdk.round_to_tick(down_price, down_tick)
+        # ── Standard independent pricing ──
+        up_price = self._maker_price(up_snap)
+        down_price = self._maker_price(down_snap)
+        up_price = self.sdk.round_to_tick(up_price, up_tick)
+        down_price = self.sdk.round_to_tick(down_price, down_tick)
 
-            # Cross-validate: Up + Down ≤ 1.0 — skip if sum exceeds 1.0 (guaranteed loss)
-            total = up_price + down_price
-            if total > 1.0:
-                logger.info("[%s] Price sum %.4f > 1.0 → skip (independent pricing)",
-                            slug, total)
-                return None, None
+        # Cross-validate: Up + Down ≤ pair_cost_max — skip if sum exceeds cap (guaranteed loss)
+        total = up_price + down_price
+        if total > self.cfg.pair_cost_max:
+            logger.info("[%s] Price sum %.4f > 1.0 → skip (independent pricing)",
+                        slug, total)
+            return None, None
 
         return up_price, down_price
 
@@ -878,29 +878,49 @@ class TradingEngine:
 
     async def _cancel_stale_pending(self, ws: WindowState, up_price: float,
                                      down_price: float):
-        """Cancel pending orders whose price has moved beyond the threshold.
+        """Cancel pending orders on time or price deviation, whichever comes first.
 
-        Compares each pending order's price to the current maker reference
-        price computed by _maker_price.  Skips orders younger than cancel_min_age.
+        Two independent triggers (OR):
+          - Time-based:  age >= cancel_max_age  → force cancel
+          - Price-based: age >= cancel_min_age AND deviation > threshold → cancel
+
+        Orders with remaining < min_order_size are excluded (can't re-place).
         """
         threshold = self.cfg.cancel_replace_threshold
         min_age = self.cfg.cancel_min_age
+        max_age = self.cfg.cancel_max_age
+        min_qty = self.cfg.min_order_size
         now = time.time()
         for oid in list(ws.pending_orders):
             po = ws.pending_orders[oid]
             if po.cancelled_at > 0:
                 continue
-            if now - po.placed_at < min_age:
+            if po.remaining < min_qty:
                 continue
+            if po.filled > 0:
+                continue  # partial fill — don't cancel, let it ride
+
+            age = now - po.placed_at
             current_price = up_price if po.side == "Up" else down_price
             deviation = abs(po.price - current_price) / max(po.price, 0.001)
-            if deviation > threshold:
+
+            # Time-based trigger
+            if age >= max_age:
                 logger.info(
-                    "  [cancel-replace] %s order=%s… old=%.4f new=%.4f "
+                    "  [cancel-time] %s order=%s… age=%.0fs >= max=%.0fs  "
+                    "price=%.4f dev=%.1f%%",
+                    po.side, oid[:12], age, max_age, po.price, deviation * 100,
+                )
+                await self.executor.cancel(oid)
+                continue
+
+            # Price-based trigger
+            if age >= min_age and deviation > threshold:
+                logger.info(
+                    "  [cancel-price] %s order=%s… old=%.4f new=%.4f "
                     "dev=%.1f%% thresh=%.0f%% age=%.0fs",
                     po.side, oid[:12], po.price, current_price,
-                    deviation * 100, threshold * 100,
-                    now - po.placed_at,
+                    deviation * 100, threshold * 100, age,
                 )
                 await self.executor.cancel(oid)
 

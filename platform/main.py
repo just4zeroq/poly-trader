@@ -56,10 +56,11 @@ async def async_main(args: argparse.Namespace):
             print("See config.py for all credential options")
             sys.exit(1)
 
-    if args.per_tick is not None:
-        cfg.per_tick = args.per_tick
     if args.max_side is not None:
         cfg.max_per_side = args.max_side
+
+    if args.per_tick is not None:
+        cfg.min_order_size = args.per_tick
 
     if args.market:
         cfg.market_specs = [parse_market_spec(args.market)]
@@ -150,6 +151,7 @@ def main():
 
     setup_logging(args.verbose)
 
+    cfg = Config()
     mode_label = {"info": "Info", "run": "Live", "check": "Credential Check"}.get(args.mode, args.mode)
     spec = parse_market_spec(args.market) if args.market else None
     print(f"{'═' * 50}")
@@ -158,8 +160,7 @@ def main():
     if spec:
         print(f"  {spec} [{spec.slug_pattern}]")
     if args.mode == "run":
-        print(f"  per_tick={args.per_tick or Config().per_tick}, "
-              f"max_per_side={args.max_side or Config().max_per_side}")
+        print(f"  max_per_side={args.max_side or cfg.max_per_side}")
     print()
 
     try:
