@@ -15,7 +15,6 @@ poly_trader/
 │   ├── strategy.py            Pair-first maker strategy (V3)
 │   ├── executors.py           LiveExecutor — real Polymarket orders + user WS fill tracking
 │   ├── models.py              Data models — MarketInfo, WindowState, OrderBookSnapshot, Pair
-│   ├── tail_sweep.py          Tail-end sweep strategy
 │   ├── gamma_discovery.py     Gamma API market discovery
 │   └── run_info.py            Market info query tool
 ├── tools/
@@ -29,7 +28,6 @@ poly_trader/
 ├── analysis/                  Analysis & backtesting
 │   ├── entry_timing.py        Entry timing analysis
 │   ├── perf_analysis.py       Performance analysis
-│   ├── tail_sweep_analysis.py Tail sweep strategy analysis
 │   ├── analyze_all_btc.py     BTC backtest analysis
 │   ├── analyze_history.py     Historical analysis
 │   └── simulate_tail.py       Tail sweep simulation
@@ -38,7 +36,6 @@ poly_trader/
 │   └── run_live.sh            Live trading launcher
 ├── __init__.py                Package init, re-exports key classes
 ├── __main__.py                python -m poly_trader entry point
-├── tail_sweep.py              Thin stub → delegates to platform.tail_sweep
 ├── .env                       Environment configuration
 ├── .gitignore
 └── CLAUDE.md
@@ -49,7 +46,6 @@ poly_trader/
 ```bash
 python -m poly_trader info                               # query current market
 python -m poly_trader run --market btc-updown-15m         # live trading (maker strategy)
-python -m poly_trader.platform.tail_sweep --market btc-updown-15m  # standalone tail-end sweep
 python -m poly_trader check                               # verify credentials
 ```
 
