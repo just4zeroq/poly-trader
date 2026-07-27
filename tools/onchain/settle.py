@@ -24,10 +24,10 @@ else:
     load_dotenv(override=False)
 
 logging.basicConfig(level=logging.WARNING, format="%(message)s")
-logging.getLogger("poly_trader.tools.polymarket.client").setLevel(logging.ERROR)
+logging.getLogger("poly_trader.platforms.poly_client").setLevel(logging.ERROR)
 
-from poly_trader.tools.polymarket.client import SdkClient
-from poly_trader.platform.config import Config
+from poly_trader.platforms.poly_client import SdkClient
+from poly_trader.platforms.config import Config
 
 
 async def main(do_it: bool = False):

@@ -93,6 +93,7 @@ class Config:
     Prevents new orders from accumulating too many unmatched lots."""
 
     # ── Markets ──
+    market_slug: str = field(default_factory=lambda: _env("market", "btc-updown-15m"))
     market_specs: list[MarketSpec] = field(default_factory=list)
 
     # ── Window ──

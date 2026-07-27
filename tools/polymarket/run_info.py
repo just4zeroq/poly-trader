@@ -16,7 +16,7 @@ import time
 
 import aiohttp
 
-from ...platform.models import MarketSpec
+from ...platforms.models import MarketSpec
 
 DEFAULT_MARKET_SPECS = [
     MarketSpec(symbol="BTC", duration_min=15, slug_pattern="btc-updown-15m"),

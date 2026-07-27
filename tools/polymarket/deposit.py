@@ -17,8 +17,8 @@ from web3 import Web3
 from polymarket.calls import MAX_UINT256, TransactionCall
 from polymarket.types import HexString
 
-from ...platform.config import Config
-from .client import SdkClient
+from ...platforms.config import Config
+from ...platforms.poly_client import SdkClient
 
 # Polygon RPC (read-only checks only — writes go through SDK)
 RPC = "https://polygon.drpc.org"

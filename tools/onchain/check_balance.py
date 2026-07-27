@@ -1,7 +1,7 @@
 """Quick balance check — prints USDC collateral balance."""
 import asyncio
-from ...platform.config import Config
-from ..polymarket.client import SdkClient
+from ...platforms.config import Config
+from ...platforms.poly_client import SdkClient
 
 async def main():
     cfg = Config()

@@ -20,7 +20,7 @@ from typing import Optional
 
 import aiohttp
 
-from ...platform.models import MarketSpec
+from ...platforms.models import MarketSpec
 
 logger = logging.getLogger("poly_trader.tools.polymarket.gamma_discovery")
 

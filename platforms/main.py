@@ -6,8 +6,7 @@ Usage:
   python -m poly_trader run                    # live trade (real orders)
   python -m poly_trader check                  # verify credentials
 
-  python -m poly_trader run --per-tick 5 --max-side 20
-  python -m poly_trader run --market btc-updown-15m
+  python -m poly_trader run --max-side 20
 """
 
 from __future__ import annotations
@@ -56,13 +55,10 @@ async def async_main(args: argparse.Namespace):
             print("See config.py for all credential options")
             sys.exit(1)
 
-    if args.per_tick is not None:
-        cfg.per_tick = args.per_tick
     if args.max_side is not None:
         cfg.max_per_side = args.max_side
 
-    if args.market:
-        cfg.market_specs = [parse_market_spec(args.market)]
+    cfg.market_specs = [parse_market_spec(cfg.market_slug)]
 
     if args.mode == "info":
         engine = TradingEngine(cfg)
@@ -72,11 +68,6 @@ async def async_main(args: argparse.Namespace):
     if args.mode == "check":
         await check_credentials(cfg)
         return
-
-    if not cfg.market_specs:
-        print("ERROR: --market is required in run mode")
-        print("  e.g. python -m poly_trader run --market btc-updown-15m")
-        sys.exit(1)
 
     engine = TradingEngine(cfg, executor=LiveExecutor())
     try:
@@ -89,7 +80,7 @@ async def async_main(args: argparse.Namespace):
 
 async def check_credentials(cfg: Config):
     """Verify Polymarket credentials work. Exits with 1 on failure."""
-    from ..tools.polymarket.client import SdkClient
+    from .poly_client import SdkClient
 
     ok = True
 
@@ -136,14 +127,8 @@ def main():
         choices=["info", "run", "check"],
         help="info=query market, run=live trading, check=verify credentials",
     )
-    parser.add_argument("--per-tick", type=int, default=None,
-                        help="max contracts per tick per side")
     parser.add_argument("--max-side", type=int, default=None,
                         help="max position per side")
-    parser.add_argument(
-        "--market", type=str, default=None,
-        help='Market slug pattern, e.g. "btc-updown-15m" (required for run)',
-    )
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="debug-level logging")
     args = parser.parse_args()
@@ -151,15 +136,13 @@ def main():
     setup_logging(args.verbose)
 
     mode_label = {"info": "Info", "run": "Live", "check": "Credential Check"}.get(args.mode, args.mode)
-    spec = parse_market_spec(args.market) if args.market else None
+    cfg = Config()
     print(f"{'═' * 50}")
     print(f"  Polymarket Temporal Arbitrage — {mode_label} Mode")
     print(f"{'═' * 50}")
-    if spec:
-        print(f"  {spec} [{spec.slug_pattern}]")
+    print(f"  {parse_market_spec(cfg.market_slug)} [{cfg.market_slug}]")
     if args.mode == "run":
-        print(f"  per_tick={args.per_tick or Config().per_tick}, "
-              f"max_per_side={args.max_side or Config().max_per_side}")
+        print(f"  max_per_side={args.max_side or cfg.max_per_side}")
     print()
 
     try:

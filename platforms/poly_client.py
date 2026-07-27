@@ -29,8 +29,8 @@ from polymarket.streams._specs import MarketSpec as SdkMarketSpec
 
 from polymarket.streams._specs import UserSpec
 
-from ...platform.config import Config
-from ...platform.models import MarketInfo, MarketSpec, PendingOrder
+from .config import Config
+from .models import MarketInfo, MarketSpec, PendingOrder
 
 logger = logging.getLogger(__name__)
 

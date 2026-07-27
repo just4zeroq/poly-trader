@@ -34,7 +34,7 @@ from polymarket.models.clob.market_events import (
     MarketPriceChangeEvent,
 )
 
-from ..tools.polymarket.client import SdkClient
+from .poly_client import SdkClient
 from .executors import LiveExecutor, OrderExecutor
 from .models import (
     Decision,

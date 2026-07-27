@@ -111,9 +111,9 @@ def simulate_maker_only(up_trades, down_trades, tail_start, ws_end):
 async def main():
     import sys
     sys.path.insert(0, "/home/ubuntu/code")
-    from poly_trader.tools.polymarket.client import SdkClient
-    from poly_trader.platform.config import Config
-    from poly_trader.platform.main import parse_market_spec
+    from poly_trader.platforms.poly_client import SdkClient
+    from poly_trader.platforms.config import Config
+    from poly_trader.platforms.main import parse_market_spec
 
     cfg = Config()
     spec = parse_market_spec("btc-updown-15m")

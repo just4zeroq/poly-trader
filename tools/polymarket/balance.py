@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 logging.basicConfig(level=logging.WARNING, format="%(message)s")
-logging.getLogger("poly_trader.tools.polymarket.client").setLevel(logging.ERROR)
+logging.getLogger("poly_trader.platforms.poly_client").setLevel(logging.ERROR)
 
 # ── ensure poly_trader is importable ──
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
@@ -23,8 +23,8 @@ if _env_path.exists():
 else:
     load_dotenv(override=False)
 
-from poly_trader.tools.polymarket.client import SdkClient
-from poly_trader.platform.config import Config
+from poly_trader.platforms.poly_client import SdkClient
+from poly_trader.platforms.config import Config
 
 
 def _fmt_usd(raw: int) -> str:

@@ -6,8 +6,8 @@ Message-driven architecture:
 """
 
 # Re-export key classes for backward compatibility
-from .platform.config import Config
-from .platform.models import (
+from .platforms.config import Config
+from .platforms.models import (
     MarketSpec,
     MarketInfo,
     OrderBookSnapshot,
@@ -26,6 +26,6 @@ from .platform.models import (
     WindowStart,
     WindowEnd,
 )
-from .platform.engine import TradingEngine
-from .platform.executors import LiveExecutor, OrderExecutor
-from .platform.strategy import MakerStrategy
+from .platforms.engine import TradingEngine
+from .platforms.executors import LiveExecutor, OrderExecutor
+from .platforms.strategy import MakerStrategy
