@@ -94,9 +94,14 @@ class MakerStrategy:
     def _free_pair(self, ws: WindowState):
         """Match unpaired Up and Down lots where cost <= pair_cost_max.
 
-        Greedy matching: for each unpaired Up lot, find the cheapest
-        unpaired Down lot that keeps the pair cost within budget.
-        Updates lot paired_qty in-place — no orders placed.
+        Strategy: sort Up ascending (cheapest first), Down descending (most
+        expensive first).  Each cheap Up pairs with the most expensive Down
+        that still fits the budget, preserving cheap Down lots for expensive
+        Up lots that can't pair otherwise.
+
+        This is a two-pointer maximum-bipartite-matching under a monotonic
+        cost constraint — pairing cheap+expensive maximizes total matched
+        contracts compared to cheap+cheap greedy.
         """
         cfg = self.cfg
         up_lots = [l for l in ws.lots if l.side == "Up" and l.unpaired_qty > 0]
@@ -105,33 +110,27 @@ class MakerStrategy:
         if not up_lots or not down_lots:
             return
 
-        # Sort by price (lowest first) to pair cheaper lots first
-        up_lots.sort(key=lambda l: l.price)
-        down_lots.sort(key=lambda l: l.price)
+        up_lots.sort(key=lambda l: l.price)               # cheapest Up first
+        down_lots.sort(key=lambda l: l.price, reverse=True)  # most expensive Down first
 
         paired = 0
         for ul in up_lots:
             if ul.is_fully_paired:
                 continue
             for dl in down_lots:
-                if dl.is_fully_paired:
-                    continue
                 if dl.unpaired_qty <= 0:
                     continue
                 if ul.unpaired_qty <= 0:
-                    break  # this Up lot is fully paired
+                    break
 
-                # Cost check
+                # Cost check: too expensive → cheaper Down next (descending), try next
                 if ul.price + dl.price > cfg.pair_cost_max:
                     continue
 
-                # Pair by minimum unpaired qty
+                # Found a match
                 pair_qty = min(ul.unpaired_qty, dl.unpaired_qty)
                 ul.paired_qty += pair_qty
                 dl.paired_qty += pair_qty
-                pair_id = f"fp_{ul.lot_id}_{dl.lot_id}"
-                ul.pair_id = pair_id
-                dl.pair_id = pair_id
                 paired += pair_qty
 
         if paired:
@@ -155,8 +154,14 @@ class MakerStrategy:
     ) -> list[Decision] | None:
         """First try re-pairing existing pairs, then new pair for imbalance.
 
-        Re-pair: existing pair has one side filled, place the missing side.
-        New pair: no re-pair needed, place to cover unpaired lots.
+        Phase A — Re-pair: for each incomplete pair, find the lagging side
+        (one side has fewer fills) and place one order to catch up.
+        Handles both "one side full" and "both sides partial" cases.
+
+        Phase B — New pair: scan unpaired heavy lots individually and find
+        the first affordable one to pair against a new light-side order.
+        Per-lot cost check (not average) avoids skipping good lots just
+        because another expensive lot drags the average up.
 
         Returns a decision list or None to fall through to step 3.
         """
@@ -166,24 +171,25 @@ class MakerStrategy:
         for pair in ws.pairs:
             if pair.is_complete:
                 continue
-            pending_side = pair.pending_side
-            if pending_side is None:
-                continue  # both sides still pending
 
-            # Price for missing side = current market price
-            if pending_side == "Up":
-                price = up_price
+            # Determine which side is lagging
+            if pair.up_filled < pair.down_filled:
+                pending_side = "Up"
                 filled_price = pair.down_price
-                remaining = pair.qty - pair.up_filled
-            else:
-                price = down_price
+                remaining = pair.down_filled - pair.up_filled
+                price = up_price
+            elif pair.down_filled < pair.up_filled:
+                pending_side = "Down"
                 filled_price = pair.up_price
-                remaining = pair.qty - pair.down_filled
+                remaining = pair.up_filled - pair.down_filled
+                price = down_price
+            else:
+                continue  # balanced, nothing to re-pair
 
             if price <= 0:
                 continue
 
-            # Cost check: filled_side_price + current_price <= pair_cost_max
+            # Cost check: filled side's price + current price <= pair_cost_max
             if filled_price + price > cfg.pair_cost_max:
                 logger.info(
                     "  [re-pair] %s cost %.4f + %.4f = %.4f > %.2f → skip",
@@ -218,7 +224,7 @@ class MakerStrategy:
             qty = min(remaining, cfg.min_order_size, room)
             if qty >= cfg.min_order_size:
                 logger.info(
-                    "  [re-pair] %s %d @ %.4f (pair=%s, remaining=%d)",
+                    "  [re-pair] %s %d @ %.4f (pair=%s, gap=%d)",
                     pending_side, qty, price, pair.pair_id, remaining,
                 )
                 return [Decision(side=pending_side, amount=qty, price=price, pair_id=pair.pair_id)]
@@ -233,43 +239,66 @@ class MakerStrategy:
         if unpaired_up == 0 and unpaired_down == 0:
             return None
 
-        # Determine which side to buy
+        # Determine which side to buy, then find first affordable heavy lot
         if unpaired_up > unpaired_down:
             pair_side = "Down"
             heavy_lots = [l for l in unpaired_up_lots if l.unpaired_qty > 0]
             heavy_label = "Up"
-            price_raw = down_price
+            price = down_price
         elif unpaired_down > unpaired_up:
             pair_side = "Up"
             heavy_lots = [l for l in unpaired_down_lots if l.unpaired_qty > 0]
             heavy_label = "Down"
-            price_raw = up_price
+            price = up_price
         else:
-            avg_up = (
-                sum(l.price * l.unpaired_qty for l in unpaired_up_lots) / unpaired_up
-                if unpaired_up > 0 else 0
-            )
-            avg_down = (
-                sum(l.price * l.unpaired_qty for l in unpaired_down_lots) / unpaired_down
-                if unpaired_down > 0 else 0
-            )
-            if avg_up >= avg_down:
-                pair_side = "Down"
-                heavy_lots = [l for l in unpaired_up_lots if l.unpaired_qty > 0]
-                heavy_label = "Up"
-                price_raw = down_price
+            # Equal unpaired qty — find the lot with higher price on either side
+            candidates: list[tuple] = []
+            for l in unpaired_up_lots:
+                if l.unpaired_qty > 0:
+                    candidates.append((l, "Down", down_price))  # if buying Down
+            for l in unpaired_down_lots:
+                if l.unpaired_qty > 0:
+                    candidates.append((l, "Up", up_price))      # if buying Up
+            if not candidates:
+                return None
+            # Sort by heavy price descending: try the most expensive heavy lot first
+            candidates.sort(key=lambda x: x[0].price, reverse=True)
+            for heavy_lot, p_side, p_price in candidates:
+                if heavy_lot.price + p_price <= cfg.pair_cost_max:
+                    pair_side = p_side
+                    heavy_lot_selected = heavy_lot
+                    heavy_label = "Down" if p_side == "Up" else "Up"
+                    price = p_price
+                    break
             else:
-                pair_side = "Up"
-                heavy_lots = [l for l in unpaired_down_lots if l.unpaired_qty > 0]
-                heavy_label = "Down"
-                price_raw = up_price
+                logger.info(
+                    "  [pair_order] No affordable pair at current prices → skip",
+                )
+                return None
 
-        heavy_qty = sum(l.unpaired_qty for l in heavy_lots)
-        if heavy_qty <= 0:
+            exposure = exposure_up if pair_side == "Up" else exposure_down
+            room = cfg.max_per_side - exposure
+            heavy_lots = [heavy_lot_selected]
+
+        # Find first affordable heavy lot (per-lot cost check)
+        heavy_lot = None
+        for lot in heavy_lots:
+            if lot.unpaired_qty <= 0:
+                continue
+            if lot.price + price > cfg.pair_cost_max:
+                continue
+            heavy_lot = lot
+            break
+
+        if heavy_lot is None:
+            logger.info(
+                "  [pair_order] %s cost check: all heavy lots too expensive "
+                "(price=%.4f, first heavy=%.4f) → skip",
+                pair_side, price,
+                heavy_lots[0].price if heavy_lots else 0,
+            )
             return None
-        avg_heavy = sum(l.price * l.unpaired_qty for l in heavy_lots) / heavy_qty
 
-        price = price_raw
         if price <= 0:
             return None
         exposure = exposure_up if pair_side == "Up" else exposure_down
@@ -279,14 +308,6 @@ class MakerStrategy:
             logger.info(
                 "  [pair_order] %s at limit %d/%d → skip",
                 pair_side, exposure, cfg.max_per_side,
-            )
-            return None
-
-        # Cost check
-        if avg_heavy + price > cfg.pair_cost_max:
-            logger.info(
-                "  [pair_order] %s cost %.4f + %.4f = %.4f > %.2f → skip",
-                pair_side, avg_heavy, price, avg_heavy + price, cfg.pair_cost_max,
             )
             return None
 
@@ -307,38 +328,28 @@ class MakerStrategy:
         qty = min(cfg.min_order_size, room)
         if qty >= cfg.min_order_size:
             logger.info(
-                "  [pair_order] %s %d @ %.4f (heavy=%s avg=%.4f need=%d)",
-                pair_side, qty, price, heavy_label, avg_heavy, heavy_qty,
+                "  [pair_order] %s %d @ %.4f (heavy=%s lot=%.4f need=%d/%d)",
+                pair_side, qty, price, heavy_label,
+                heavy_lot.price, heavy_lot.unpaired_qty, heavy_lot.amount,
             )
 
             # Create Pair object for fill tracking
             pair = Pair(
                 pair_id=f"pair_{ws.window_num}_{len(ws.pairs)}",
-                up_price=up_price if pair_side == "Up" else avg_heavy,
-                down_price=down_price if pair_side == "Down" else avg_heavy,
+                up_price=up_price if pair_side == "Up" else heavy_lot.price,
+                down_price=down_price if pair_side == "Down" else heavy_lot.price,
                 qty=cfg.min_order_size,
             )
             ws.pairs.append(pair)
 
-            # Pre-fill the heavy side — these lots already exist in inventory.
-            # Without this, the Pair would show "pending_side=heavy_side" after the
-            # light side fills, triggering a false re-pair that buys more on the
-            # heavy side (net new position, not pairing).
+            # Pre-fill the heavy side — this specific lot
             if pair_side == "Down":
-                pair.up_filled = qty  # existing Up lots are pre-paired
+                pair.up_filled = qty
             else:
-                pair.down_filled = qty  # existing Down lots are pre-paired
-            # Update the heavy lots so _pair_lots_in_same_pair and _free_pair
-            # see them as already paired.
-            remaining = qty
-            for lot in heavy_lots:
-                if remaining <= 0:
-                    break
-                match = min(lot.unpaired_qty, remaining)
-                if match > 0:
-                    lot.paired_qty += match
-                    lot.pair_id = pair.pair_id
-                    remaining -= match
+                pair.down_filled = qty
+            match = min(heavy_lot.unpaired_qty, qty)
+            heavy_lot.paired_qty += match
+            heavy_lot.pair_id = pair.pair_id
 
             return [Decision(side=pair_side, amount=qty, price=price, pair_id=pair.pair_id)]
 
