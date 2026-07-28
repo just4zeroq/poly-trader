@@ -884,6 +884,12 @@ class TradingEngine:
                 batch_cancelled = await self.executor.cancel_batch(
                     [pair.up_order_id, pair.down_order_id],
                 )
+                if batch_cancelled == 0:
+                    logger.warning(
+                        "  [cancel-2leg] batch cancel failed entirely  pair=%s",
+                        pair.pair_id,
+                    )
+                    continue
                 if batch_cancelled < 2:
                     logger.warning(
                         "  [cancel-2leg] batch cancel: %d/2 succeeded  pair=%s",
@@ -904,7 +910,13 @@ class TradingEngine:
                     "pair=%s accumulate=%d",
                     side, po.order_id[:12], age, pair.pair_id, ws.accumulate,
                 )
-                await self.executor.cancel(po.order_id)
+                ok, _ = await self.executor.cancel(po.order_id)
+                if not ok:
+                    logger.warning(
+                        "  [cancel-1leg] cancel failed  order=%s…  pair=%s",
+                        po.order_id[:12], pair.pair_id,
+                    )
+                    continue
                 self._clear_pair_order(pair, side)
                 ws.pairs.remove(pair)
                 ws.accumulate = max(0, ws.accumulate - pair.qty)
