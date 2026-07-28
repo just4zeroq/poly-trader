@@ -559,8 +559,8 @@ class TradingEngine:
             # cheap-seeker has enough runway to accumulate before the cut-off.
             min_remain = max(90, self.cfg.min_remaining_time + 60)
 
-            if remaining >= min_remain:
-                # Window has enough time left — join it
+            if remaining >= min_remain and elapsed < 60:
+                # Window has enough time left and we're near the start — join it
                 if elapsed < 1.0:
                     await asyncio.sleep(ws_ts + 1.0 - now)
                 return
@@ -835,88 +835,74 @@ class TradingEngine:
                                      down_price: float):
         """Cancel stale 0-fill pending orders from fresh Pairs.
 
-        Single-leg order: cancel after cancel_min_age (default 2 min).
-        Two-leg order:   cancel after cancel_min_age OR when price moves
-                         >= cancel_replace_threshold (default 0.10).
+        Processed by Pair, not by order:
+          1. Single-leg: cancel the pending order if age >= cancel_min_age.
+          2. Two-leg (both pending): cancel BOTH orders if
+             age >= cancel_min_age AND price_diff >= cancel_replace_threshold.
 
-        Accumulate is freed when both sides of the fresh Pair are done.
+        Removes the Pair from ws.pairs and frees accumulate on cancel.
         """
         min_age = self.cfg.cancel_min_age
         price_dev = self.cfg.cancel_replace_threshold
-        min_qty = self.cfg.min_order_size
         now = time.time()
 
-        # Snapshots of Pair state before loop — pair dissolve may mutate ws.pairs
-        snap = {p.pair_id: p for p in ws.pairs}
-        two_leg_ids = {p.pair_id for p in ws.pairs if p.up_order_id and p.down_order_id}
+        for pair in list(ws.pairs):
+            # Determine active pending orders on this pair
+            up_po = ws.pending_orders.get(pair.up_order_id) if pair.up_order_id else None
+            down_po = ws.pending_orders.get(pair.down_order_id) if pair.down_order_id else None
 
-        for oid in list(ws.pending_orders):
-            po = ws.pending_orders[oid]
-            if po.cancelled_at > 0 or po.remaining < min_qty or po.filled > 0:
+            has_up = up_po is not None and up_po.cancelled_at == 0
+            has_down = down_po is not None and down_po.cancelled_at == 0
+
+            if not has_up and not has_down:
+                continue  # dead pair — no active orders
+
+            # Only fresh pairs (no fills)
+            if pair.up_filled != 0 or pair.down_filled != 0:
+                continue
+            if (has_up and up_po.filled > 0) or (has_down and down_po.filled > 0):
                 continue
 
-            pair = snap.get(po.pair_id) if po.pair_id else None
-            if not pair or pair.up_filled != 0 or pair.down_filled != 0:
-                continue  # not a fresh pair — let it ride
+            is_two_leg = has_up and has_down
 
-            age = now - po.placed_at
-            current_price = up_price if po.side == "Up" else down_price
-            is_two_leg = po.pair_id in two_leg_ids
-
-            cancel_reason = ""
-            if age >= min_age:
-                cancel_reason = "time"
-            elif is_two_leg and abs(po.price - current_price) >= price_dev:
-                cancel_reason = "price-dev"
-
-            if not cancel_reason:
-                continue
-
-            logger.info(
-                "  [cancel-%s] %s order=%s… age=%.0fs price_diff=%.4f  "
-                "pair=%s accumulate=%d",
-                cancel_reason, po.side, oid[:12], age,
-                abs(current_price - po.price), po.pair_id or "-", ws.accumulate,
-            )
-            ok, cancelled_side = await self.executor.cancel(oid)
-            if not ok or not cancelled_side:
-                continue
-
-            # ── Pair cleanup (dissolve logic moved from executor) ──
-            # Clear the cancelled order from its Pair
-            self._clear_pair_order(pair, cancelled_side)
-
-            # Dissolve fresh pairs: no fills on either side → remove
-            prefill_only = (
-                (pair.up_filled == pair.qty and pair.down_filled == 0)
-                or (pair.down_filled == pair.qty and pair.up_filled == 0)
-            )
-            if po.filled == 0 and prefill_only:
-                pair.up_filled = 0
-                pair.down_filled = 0
-                ws.pairs.remove(pair)
-                logger.info(
-                    "  [cancel] Pair %s dissolved (order %s had no fills)",
-                    pair.pair_id, oid[:12],
+            if is_two_leg:
+                # Two-leg: require BOTH age >= min_age AND price moved significantly
+                max_age = max(now - up_po.placed_at, now - down_po.placed_at)
+                max_diff = max(
+                    abs(up_po.price - up_price),
+                    abs(down_po.price - down_price),
                 )
-            elif pair.up_filled == 0 and pair.down_filled == 0:
-                ws.pairs.remove(pair)
-                logger.info(
-                    "  [cancel] Pair %s dissolved (no fills on either side)",
-                    pair.pair_id,
-                )
+                if not (max_age >= min_age and max_diff >= price_dev):
+                    continue
 
-            # Free accumulate when both sides of this Pair are done
-            if self._pair_both_done(pair, ws.pending_orders):
+                logger.info(
+                    "  [cancel-2leg] Up=%s… Down=%s… age=%.0fs diff=%.4f  "
+                    "pair=%s accumulate=%d",
+                    pair.up_order_id[:12], pair.down_order_id[:12],
+                    max_age, max_diff, pair.pair_id, ws.accumulate,
+                )
+                await self.executor.cancel(pair.up_order_id)
+                await self.executor.cancel(pair.down_order_id)
+                self._clear_pair_order(pair, "Up")
+                self._clear_pair_order(pair, "Down")
+                ws.pairs.remove(pair)
                 ws.accumulate = max(0, ws.accumulate - pair.qty)
+            else:
+                # Single-leg: cancel on age
+                side, po = ("Up", up_po) if has_up else ("Down", down_po)
+                age = now - po.placed_at
+                if age < min_age:
+                    continue
 
-    @staticmethod
-    def _pair_both_done(pair: Pair, pending: dict[str, PendingOrder]) -> bool:
-        """Return True if neither side of the pair has an active pending order."""
-        def _side_active(order_id: str) -> bool:
-            return (order_id and order_id in pending
-                    and pending[order_id].cancelled_at == 0)
-        return not _side_active(pair.up_order_id) and not _side_active(pair.down_order_id)
+                logger.info(
+                    "  [cancel-1leg] %s order=%s… age=%.0fs  "
+                    "pair=%s accumulate=%d",
+                    side, po.order_id[:12], age, pair.pair_id, ws.accumulate,
+                )
+                await self.executor.cancel(po.order_id)
+                self._clear_pair_order(pair, side)
+                ws.pairs.remove(pair)
+                ws.accumulate = max(0, ws.accumulate - pair.qty)
 
     @staticmethod
     def _clear_pair_order(pair: Pair, side: str) -> None:
