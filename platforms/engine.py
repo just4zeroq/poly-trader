@@ -881,10 +881,15 @@ class TradingEngine:
                     pair.up_order_id[:12], pair.down_order_id[:12],
                     max_age, max_diff, pair.pair_id, ws.accumulate,
                 )
-                await self.executor.cancel(pair.up_order_id)
-                await self.executor.cancel(pair.down_order_id)
-                self._clear_pair_order(pair, "Up")
-                self._clear_pair_order(pair, "Down")
+                batch_cancelled = await self.executor.cancel_batch(
+                    [pair.up_order_id, pair.down_order_id],
+                )
+                if batch_cancelled < 2:
+                    logger.warning(
+                        "  [cancel-2leg] batch cancel: %d/2 succeeded  pair=%s",
+                        batch_cancelled, pair.pair_id,
+                    )
+                self._clear_pair_order(pair)  # both sides
                 ws.pairs.remove(pair)
                 ws.accumulate = max(0, ws.accumulate - pair.qty)
             else:
@@ -905,11 +910,15 @@ class TradingEngine:
                 ws.accumulate = max(0, ws.accumulate - pair.qty)
 
     @staticmethod
-    def _clear_pair_order(pair: Pair, side: str) -> None:
-        """Clear the order_id on *pair* for the given side."""
-        if side == "Up":
-            pair.up_order_id = ""
+    def _clear_pair_order(pair: Pair, side: str = "") -> None:
+        """Clear order_id(s) on *pair*.  Clears both sides if *side* is empty."""
+        if side:
+            if side == "Up":
+                pair.up_order_id = ""
+            else:
+                pair.down_order_id = ""
         else:
+            pair.up_order_id = ""
             pair.down_order_id = ""
 
     # ── Order execution ──

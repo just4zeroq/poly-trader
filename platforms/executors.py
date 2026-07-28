@@ -59,6 +59,10 @@ class OrderExecutor:
     async def cancel(self, order_id: str) -> bool:
         raise NotImplementedError
 
+    async def cancel_batch(self, order_ids: list[str]) -> int:
+        """Cancel multiple orders in one API call. Returns count cancelled."""
+        raise NotImplementedError
+
     async def handle_user_event(self, event):
         """Handle authenticated user WS event — no-op in base."""
         pass
@@ -334,6 +338,29 @@ class LiveExecutor(OrderExecutor):
                 return True, po.side
         logger.warning("  [cancel] SDK cancel_order(%s…) FAILED", order_id[:12])
         return ok, None
+
+    async def cancel_batch(self, order_ids: list[str]) -> int:
+        """Cancel multiple orders in one API call. Returns count cancelled.
+
+        Sets cancelled_at and emits order_cancelled for each success.
+        """
+        if not order_ids:
+            return 0
+        cancelled = await self.engine.sdk.cancel_orders_batch(order_ids)
+        if cancelled <= 0:
+            return 0
+        for ws in list(self.engine._windows.values()):
+            for oid in order_ids:
+                po = ws.pending_orders.get(oid)
+                if po is None:
+                    continue
+                po.cancelled_at = time.time()
+                asyncio.ensure_future(self.engine._emit("order_cancelled", OrderCancelled(
+                    window_num=ws.window_num,
+                    outcome=po.side, amount=po.remaining,
+                    price=po.price, order_id=oid,
+                )))
+        return cancelled
 
     async def cancel_all(self, pending_orders: dict[str, PendingOrder]):
         """Soft-cancel all pending orders, wait for in-flight fills, then flush."""

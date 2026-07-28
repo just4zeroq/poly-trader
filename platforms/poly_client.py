@@ -439,6 +439,28 @@ class SdkClient:
             logger.warning("  [sdk] cancel_order(%s…) failed: %s", order_id[:12], e)
             return False
 
+    async def cancel_orders_batch(self, order_ids: list[str]) -> int:
+        """Cancel multiple orders in one API call.
+
+        Returns the number of orders successfully cancelled.
+        """
+        if not self._secure:
+            logger.warning("  [sdk] cancel_orders_batch FAILED: no secure client")
+            return 0
+        if not order_ids:
+            return 0
+        logger.info("  [sdk] cancel_orders_batch(%d orders)", len(order_ids))
+        try:
+            resp = await self._secure.cancel_orders(order_ids=order_ids)
+            cancelled = len(resp.canceled) if hasattr(resp, 'canceled') else 0
+            if cancelled > 0:
+                logger.info("  [sdk] cancel_orders_batch: %d/%d cancelled",
+                            cancelled, len(order_ids))
+            return int(cancelled)
+        except Exception as e:
+            logger.warning("  [sdk] cancel_orders_batch failed: %s", e)
+            return 0
+
     async def cancel_all_open_orders(self, market: Optional[str] = None) -> int:
         """Cancel open orders, optionally scoped to a market (condition ID).
 
