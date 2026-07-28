@@ -67,9 +67,9 @@ def analyze_window(ws_start: int, ws_end: int,
 
     # Max prices
     max_win_price = max(p for _, p in win_series)
-    max_win_ts = next(ts for ts, p in win_series if p == max_win_price)
+    max_win_ts = next((ts for ts, p in win_series if p == max_win_price), ws_start)
     max_lose_price = max(p for _, p in lose_series)
-    max_lose_ts = next(ts for ts, p in lose_series if p == max_lose_price)
+    max_lose_ts = next((ts for ts, p in lose_series if p == max_lose_price), ws_start)
 
     tail_start = ws_end - 180
 
@@ -104,7 +104,10 @@ def analyze_window(ws_start: int, ws_end: int,
         remaining = ws_end - t_85
         if remaining > 60:
             sweep_entry_remaining = remaining
-            max_loser_target = 1.0 - (next(p for ts, p in win_series if ts == t_85)) - 0.05
+            win_price_at_85 = next((p for ts, p in win_series if ts == t_85), None)
+            if win_price_at_85 is None:
+                win_price_at_85 = 0.85  # fallback: threshold itself
+            max_loser_target = 1.0 - win_price_at_85 - 0.05
             if max_loser_target > 0:
                 future_loser = [lp for lt, lp in lose_series if lt > t_85 and lt <= ws_end]
                 if future_loser and min(future_loser) <= max_loser_target:

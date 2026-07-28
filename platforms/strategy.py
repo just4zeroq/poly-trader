@@ -160,6 +160,8 @@ class MakerStrategy:
                 up_pair.down_order_id = down_oid
                 up_pair.down_filled += down_pair.down_filled
                 up_pair.down_price = down_pair.down_price
+                # Transfer opposite-side fills too (down_pair may have up_filled from past fills)
+                up_pair.up_filled += down_pair.up_filled
 
                 # Relink pending order to survivor
                 if down_oid and down_oid in ws.pending_orders:
@@ -267,13 +269,28 @@ class MakerStrategy:
                     continue
                 side, price = "Up", up_price
 
-            # Min gap check
-            too_close = any(
-                abs(po.price - price) < cfg.min_price_gap
-                for po in pending.values()
-                if po.side == side and po.cancelled_at == 0
-            )
-            if too_close:
+            # Min gap check — if blocked by a fresh (0-fill) stale order, cancel-replace
+            blocker = None
+            for po in pending.values():
+                if po.side == side and po.cancelled_at == 0 and abs(po.price - price) < cfg.min_price_gap:
+                    blocker = po
+                    break
+
+            import time
+            cancel_replace_min_age = 30.0  # min age before cancel-replace kicks in
+            if blocker is not None:
+                if blocker.filled == 0 and (time.time() - blocker.placed_at) >= cancel_replace_min_age:
+                    logger.info(
+                        "  [repair] Pair %s %s price %.4f blocked by %s… (age=%.0fs) → cancel-replace",
+                        pair.pair_id, side, price, blocker.order_id[:12],
+                        time.time() - blocker.placed_at,
+                    )
+                    decisions.append(Decision(
+                        side=side, amount=qty, price=price,
+                        pair_id=pair.pair_id,
+                        cancel_order_id=blocker.order_id,
+                    ))
+                    continue
                 logger.info(
                     "  [repair] Pair %s %s price %.4f too close → skip",
                     pair.pair_id, side, price,

@@ -784,6 +784,26 @@ class TradingEngine:
             if step2_repair:
                 # Step 2: individual orders for existing single-leg Pairs
                 for d in step2_repair:
+                    # Cancel-replace: kill old blocking order first (no dissolve)
+                    if d.cancel_order_id:
+                        old_po = ws_state.pending_orders.get(d.cancel_order_id)
+                        if old_po and old_po.cancelled_at == 0:
+                            await self.sdk.cancel_order(d.cancel_order_id)
+                            old_po.cancelled_at = time.time()
+                            # Clear pair's order_id so new order can link
+                            for p in ws_state.pairs:
+                                if p.pair_id == d.pair_id:
+                                    if d.side == "Up":
+                                        p.up_order_id = ""
+                                    else:
+                                        p.down_order_id = ""
+                                    break
+                            del ws_state.pending_orders[d.cancel_order_id]
+                            logger.info(
+                                "  [engine] cancel-replace %s… → new %s order",
+                                d.cancel_order_id[:12], d.side,
+                            )
+
                     token_id = market.up_token_id if d.side == "Up" else market.down_token_id
                     ok = await self._place_order(
                         market.slug, token_id, d.side, d.price, d.amount,
@@ -1080,6 +1100,10 @@ class TradingEngine:
                 elif up_mid > 0.65 and down_mid < 0.35:
                     winner = "Up"
                 elif down_mid > 0.65 and up_mid < 0.35:
+                    winner = "Down"
+                elif up_mid > down_mid:
+                    winner = "Up"
+                elif down_mid > up_mid:
                     winner = "Down"
 
         rpt = ws.report(winner=winner)

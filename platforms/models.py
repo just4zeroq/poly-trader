@@ -25,11 +25,16 @@ class MarketSpec:
 
 
 def _parse_duration_from_slug(slug: str) -> int:
-    """Extract window duration in seconds from slug like 'btc-updown-5m-1234567890'."""
+    """Extract window duration in seconds from slug like 'btc-updown-5m-1234567890'.
+
+    Polymarket slugs always contain the duration (e.g. '5m', '15m'), so the
+    900s fallback is never hit in practice.  If it were, the caller should
+    provide the actual duration from MarketSpec.
+    """
     for part in slug.split("-"):
         if part.endswith("m") and part[:-1].isdigit():
             return int(part[:-1]) * 60
-    return 900  # default
+    return 900  # default: 15m (standard Polymarket window)
 
 
 @dataclass
@@ -124,6 +129,7 @@ class Decision:
     amount: int    # order size
     price: float   # maker limit price
     pair_id: str = ""  # links to Pair.pair_id (for order ID tracking in executor)
+    cancel_order_id: str = ""  # if set, cancel this pending order before placing (cancel-replace)
 
 
 @dataclass

@@ -217,11 +217,12 @@ async def main():
         if entered:
             avg_remain = sum(r["sweeps"][key]["remaining"] for r in entered) / len(entered)
             dipped = sum(1 for r in entered if r["sweeps"][key].get("dipped_after_entry"))
+            reversed_ = sum(1 for r in entered if r["sweeps"][key].get("winner_lost"))
             print(f"    Avg remaining: {avg_remain:.0f}s")
             print(f"    Loser limit FILLED: {len(filled):>2d}/{len(entered):>2d} (profit locked)")
             print(f"    No fill (loser too expensive): {len(entered)-len(filled):>2d}/{len(entered):>2d}")
             print(f"    Dipped after entry: {dipped}/{len(entered)}")
-            print(f"    Winner reversed: 0/{len(entered)}")
+            print(f"    Winner reversed: {reversed_}/{len(entered)}")
         else:
             print(f"    (no entries)")
 
