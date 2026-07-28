@@ -731,10 +731,6 @@ class TradingEngine:
 
             t_emitted = time.time()
 
-            # Mark tick completion time for throttle (idle path — no orders placed)
-            if not decisions:
-                self._last_tick_time = time.time()
-
             # ── Place orders ──
             if decisions:
                 self._log_pending_state(market.slug, ws_state)
@@ -755,9 +751,7 @@ class TradingEngine:
                 tick_any_ok = tick_any_ok or any_ok
 
             t_placed = time.time()
-
-            if decisions:
-                self._last_tick_time = time.time()
+            self._last_tick_time = t_placed
 
             self._log_tick_timing(tick_count, t_wake, t_priced, t_decided,
                                   t_emitted, t_placed, decisions, ws_state)
@@ -890,10 +884,7 @@ class TradingEngine:
 
             # ── Pair cleanup (dissolve logic moved from executor) ──
             # Clear the cancelled order from its Pair
-            if pair.up_order_id == oid:
-                pair.up_order_id = ""
-            elif pair.down_order_id == oid:
-                pair.down_order_id = ""
+            self._clear_pair_order(pair, cancelled_side)
 
             # Dissolve fresh pairs: no fills on either side → remove
             prefill_only = (
@@ -926,6 +917,14 @@ class TradingEngine:
             return (order_id and order_id in pending
                     and pending[order_id].cancelled_at == 0)
         return not _side_active(pair.up_order_id) and not _side_active(pair.down_order_id)
+
+    @staticmethod
+    def _clear_pair_order(pair: Pair, side: str) -> None:
+        """Clear the order_id on *pair* for the given side."""
+        if side == "Up":
+            pair.up_order_id = ""
+        else:
+            pair.down_order_id = ""
 
     # ── Order execution ──
 
@@ -992,10 +991,7 @@ class TradingEngine:
         # Clear pair's order_id so new order can link
         for p in ws.pairs:
             if p.pair_id == d.pair_id:
-                if d.side == "Up":
-                    p.up_order_id = ""
-                else:
-                    p.down_order_id = ""
+                self._clear_pair_order(p, d.side)
                 break
         del ws.pending_orders[d.cancel_order_id]
         logger.info("  [engine] cancel-replace %s… → new %s order",
