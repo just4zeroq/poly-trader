@@ -575,7 +575,7 @@ class TradingEngine:
 
     async def _run_single_window(self, spec: MarketSpec):
         """Execute one full window for a spec: discover → trade → settle."""
-        duration = spec.duration_min * 60
+        # duration = spec.duration_min * 60
 
         # ── risk checks before entering window ──
         if self.cfg.stop_on_window_loss and self._last_window_loss:
