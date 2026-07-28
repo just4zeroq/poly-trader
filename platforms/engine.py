@@ -418,50 +418,51 @@ class TradingEngine:
     # ════════════════════════════════════════════════════════════
 
     async def _run_ws(self):
-        """Run SDK-based WS subscription — auto-restarts when tokens change.
-
-        Collects all active market token IDs, subscribes once, and
-        dispatches typed SDK events to the PriceCache.
-        """
+        """Run SDK-based WS subscription — auto-restarts on token change or error."""
         while self._running:
             tokens = self._active_token_ids()
-            if tokens == self._sub_token_ids and self._sub_handle:
-                # Subscription is current — wait for events
-                handle = self._sub_handle
-                try:
-                    async for event in handle:
-                        if not self._running:
-                            return
-                        # Re-check tokens on each event
-                        if self._active_token_ids() != self._sub_token_ids:
-                            break
-                        await self._dispatch_sdk_event(event)
-                except Exception as e:
-                    logger.warning("WS subscription error: %s", e)
-                    # Clear broken handle so reconnect path is taken
-                    self._sub_handle = None
-                    self._sub_token_ids = set()
-                finally:
-                    continue
+            if tokens and tokens == self._sub_token_ids and self._sub_handle:
+                await self._consume_ws_events()
+                continue  # event stream ended → re-check tokens at loop top
 
-            # Tokens changed or no subscription — (re)subscribe
-            if self._sub_handle:
-                await self._sub_handle.close()
-                self._sub_handle = None
-            self._sub_token_ids = set()
-
+            # (Re)subscribe: close old handle, create new one
+            await self._close_ws_handle()
             if not tokens:
                 await asyncio.sleep(1)
                 continue
+            await self._subscribe_ws(tokens)
 
-            try:
-                handle = await self.sdk.subscribe(list(tokens))
-                self._sub_handle = handle
-                self._sub_token_ids = tokens
-                logger.info("WS subscribed to %d tokens", len(tokens))
-            except Exception as e:
-                logger.warning("WS subscription failed: %s, retrying…", e)
-                await asyncio.sleep(3)
+    async def _consume_ws_events(self):
+        """Consume events from current subscription until tokens change or error."""
+        try:
+            async for event in self._sub_handle:
+                if not self._running:
+                    return
+                if self._active_token_ids() != self._sub_token_ids:
+                    break
+                await self._dispatch_sdk_event(event)
+        except Exception as e:
+            logger.warning("WS subscription error: %s", e)
+            self._sub_handle = None
+            self._sub_token_ids = set()
+
+    async def _close_ws_handle(self):
+        """Close current WS subscription handle if any."""
+        if self._sub_handle:
+            await self._sub_handle.close()
+            self._sub_handle = None
+        self._sub_token_ids = set()
+
+    async def _subscribe_ws(self, tokens: set[str]):
+        """Subscribe to a new set of token IDs."""
+        try:
+            handle = await self.sdk.subscribe(list(tokens))
+            self._sub_handle = handle
+            self._sub_token_ids = tokens
+            logger.info("WS subscribed to %d tokens", len(tokens))
+        except Exception as e:
+            logger.warning("WS subscription failed: %s, retrying…", e)
+            await asyncio.sleep(3)
 
     def _active_token_ids(self) -> set[str]:
         """Collect all token IDs from currently active markets."""
@@ -569,6 +570,8 @@ class TradingEngine:
             wait = next_start - now
             if wait > 0:
                 await asyncio.sleep(wait)
+            else:
+                await asyncio.sleep(0.1)  # overslept past window boundary
 
     async def _run_single_window(self, spec: MarketSpec):
         """Execute one full window for a spec: discover → trade → settle."""
@@ -732,105 +735,32 @@ class TradingEngine:
             if not decisions:
                 self._last_tick_time = time.time()
 
-            # ── Place orders — batch pair when both sides ──
+            # ── Place orders ──
             if decisions:
-                # Log pending order state for anomaly detection
-                for side in ("Up", "Down"):
-                    side_pending = [po for po in ws_state.pending_orders.values()
-                                    if po.side == side and po.cancelled_at == 0]
-                    if side_pending:
-                        prices = {po.order_id[:8]: f"{po.price:.4f}" for po in side_pending}
-                        logger.info("  [%s] Pending %s: %d orders  prices=%s  inv=%d",
-                                    market.slug, side, len(side_pending), prices,
-                                    ws_state.inventory[side])
+                self._log_pending_state(market.slug, ws_state)
 
-            # ── Place orders, track success/failure ──
-            tick_any_ok = False
             step3_new = [d for d in decisions if not d.pair_id]
             step2_repair = [d for d in decisions if d.pair_id]
+            tick_any_ok = False
 
             if step3_new:
-                # Step 3: new Up+Down pair — sign together, submit together
-                up_d = next(d for d in step3_new if d.side == "Up")
-                down_d = next(d for d in step3_new if d.side == "Down")
-
-                # Pre-create Pair for order ID linking in place_pair()
-                pair = Pair(
-                    pair_id=f"pair_{ws_state.window_num}_{len(ws_state.pairs)}",
-                    up_price=up_d.price, down_price=down_d.price, qty=up_d.amount,
+                tick_any_ok = await self._place_step3_pair(
+                    market, ws_state, step3_new,
                 )
-                ws_state.pairs.append(pair)
-                up_d.pair_id = pair.pair_id
-                down_d.pair_id = pair.pair_id
-
-                up_ok, down_ok = await self.executor.place_pair(
-                    market.slug,
-                    market.up_token_id, market.down_token_id,
-                    up_d.price, up_d.amount,
-                    down_d.price, down_d.amount,
-                    pair_id=up_d.pair_id,
-                )
-
-                if up_ok or down_ok:
-                    ws_state.accumulate += up_d.amount
-                logger.info(
-                    "  [engine] step3 accumulate=%d  (%s/%s)  pair=%s",
-                    ws_state.accumulate,
-                    "Up" if up_ok else "-", "Down" if down_ok else "-",
-                    pair.pair_id,
-                )
-                tick_any_ok = up_ok or down_ok
 
             if step2_repair:
-                # Step 2: individual orders for existing single-leg Pairs
-                for d in step2_repair:
-                    # Cancel-replace: kill old blocking order first (no dissolve)
-                    if d.cancel_order_id:
-                        old_po = ws_state.pending_orders.get(d.cancel_order_id)
-                        if old_po and old_po.cancelled_at == 0:
-                            await self.sdk.cancel_order(d.cancel_order_id)
-                            old_po.cancelled_at = time.time()
-                            # Clear pair's order_id so new order can link
-                            for p in ws_state.pairs:
-                                if p.pair_id == d.pair_id:
-                                    if d.side == "Up":
-                                        p.up_order_id = ""
-                                    else:
-                                        p.down_order_id = ""
-                                    break
-                            del ws_state.pending_orders[d.cancel_order_id]
-                            logger.info(
-                                "  [engine] cancel-replace %s… → new %s order",
-                                d.cancel_order_id[:12], d.side,
-                            )
-
-                    token_id = market.up_token_id if d.side == "Up" else market.down_token_id
-                    ok = await self._place_order(
-                        market.slug, token_id, d.side, d.price, d.amount,
-                        pair_id=d.pair_id,
-                    )
-                    if ok:
-                        tick_any_ok = True
+                any_ok = await self._place_step2_repair(
+                    market, ws_state, step2_repair,
+                )
+                tick_any_ok = tick_any_ok or any_ok
 
             t_placed = time.time()
 
-            # Mark tick completion for throttle (busy path — orders placed)
             if decisions:
                 self._last_tick_time = time.time()
 
-            # ── Tick timing summary (every tick, compact single-line) ──
-            dt_price  = (t_priced   - t_wake)    * 1000  # pricing phase (tick_size + resolve)
-            dt_decide = (t_decided  - t_priced)   * 1000  # cancel-replace + strategy
-            dt_emit   = (t_emitted  - t_decided)  * 1000  # event emit / idle log
-            dt_place  = (t_placed   - t_emitted)  * 1000  # order placement
-            dt_total  = (t_placed   - t_wake)     * 1000  # total tick wall-clock
-            logger.info(
-                "  ⏱ tick#%d total=%.1fms (price=%.1fms decide=%.1fms emit=%.1fms place=%.1fms) "
-                "decisions=%d pending=%d inv=U%d/D%d",
-                tick_count, dt_total, dt_price, dt_decide, dt_emit, dt_place,
-                len(decisions), len(ws_state.pending_orders),
-                ws_state.inventory["Up"], ws_state.inventory["Down"],
-            )
+            self._log_tick_timing(tick_count, t_wake, t_priced, t_decided,
+                                  t_emitted, t_placed, decisions, ws_state)
 
             # ── Consecutive failure → idle (likely out of balance) ──
             if decisions:
@@ -860,69 +790,46 @@ class TradingEngine:
         up_tick: float = 0.01, down_tick: float = 0.01,
         ws_state: Optional[WindowState] = None,
     ) -> tuple[Optional[float], Optional[float]]:
-        """Cross-validate Up/Down prices using WS orderbook data only.
+        """Resolve maker prices for Up+Down, or (None, None) to skip the tick.
 
-        Rounds to tick size before validation, so returned prices are
-        ready to use for order placement.
-
-        Skips the tick if:
-          - No fresh price data (WS data > 30s old)
-          - Up + Down deviates from 1.0 beyond max_price_dev
-
-        Returns (up_price, down_price) or (None, None) to skip.
+        Validates both orderbook snapshots are fresh and tradable, then rounds
+        to tick size and checks the pair doesn't lock in a guaranteed loss.
         """
-        now = time.time()
         up_snap = self.prices.get(up_token_id)
         down_snap = self.prices.get(down_token_id)
 
-        # Must have fresh data for both sides
         if not up_snap or not down_snap:
-            logger.info("[%s] OrderBook snap missing → skip  (up=%s down=%s)",
-                        slug, bool(up_snap), bool(down_snap))
+            logger.info("[%s] OrderBook snap missing → skip", slug)
             return None, None
 
-        up_age = now - up_snap.updated_at
-        down_age = now - down_snap.updated_at
-        if up_age > 30 or down_age > 30:
-            logger.info("[%s] Price data stale → skip  (up_age=%.1fs down_age=%.1fs)",
-                        slug, up_age, down_age)
+        if not (self._snapshot_ok(up_snap, slug, "Up")
+                and self._snapshot_ok(down_snap, slug, "Down")):
             return None, None
 
-        # Must have both bid and ask
-        if not up_snap.best_bid or not up_snap.best_ask:
-            logger.info("[%s] Up no bid/ask (%.4f/%.4f) → skip",
-                        slug, up_snap.best_bid or 0, up_snap.best_ask or 0)
-            return None, None
-        if not down_snap.best_bid or not down_snap.best_ask:
-            logger.info("[%s] Down no bid/ask (%.4f/%.4f) → skip",
-                        slug, down_snap.best_bid or 0, down_snap.best_ask or 0)
-            return None, None
+        up_price = self.sdk.round_to_tick(self._maker_price(up_snap), up_tick)
+        down_price = self.sdk.round_to_tick(self._maker_price(down_snap), down_tick)
 
-        # Skip if either side is already settled (best_bid > threshold)
-        # self.cfg.max_extreme_price  超过这个就不下单了
-        if up_snap.best_bid > self.cfg.max_extreme_price:
-            logger.info("[%s] Up best_bid %.4f > %.2f → market settled, skip",
-                        slug, up_snap.best_bid, self.cfg.max_extreme_price)
-            return None, None
-        if down_snap.best_bid > self.cfg.max_extreme_price:
-            logger.info("[%s] Down best_bid %.4f > %.2f → market settled, skip",
-                        slug, down_snap.best_bid, self.cfg.max_extreme_price)
-            return None, None
-
-        # ── Standard independent pricing ──
-        up_price = self._maker_price(up_snap)
-        down_price = self._maker_price(down_snap)
-        up_price = self.sdk.round_to_tick(up_price, up_tick)
-        down_price = self.sdk.round_to_tick(down_price, down_tick)
-
-        # Cross-validate: Up + Down ≤ pair_cost_max — skip if sum exceeds cap (guaranteed loss)
-        total = up_price + down_price
-        if total > self.cfg.pair_cost_max:
-            logger.info("[%s] Price sum %.4f > 1.0 → skip (independent pricing)",
-                        slug, total)
+        if up_price + down_price > self.cfg.pair_cost_max:
+            logger.info("[%s] Price sum %.4f > %.2f → skip", slug,
+                        up_price + down_price, self.cfg.pair_cost_max)
             return None, None
 
         return up_price, down_price
+
+    def _snapshot_ok(self, snap: OrderBookSnapshot, slug: str, side: str) -> bool:
+        """Return True if the snapshot is fresh, has bid/ask, and isn't settled."""
+        age = time.time() - snap.updated_at
+        if age > 30:
+            logger.info("[%s] %s data stale (%.1fs) → skip", slug, side, age)
+            return False
+        if not snap.best_bid or not snap.best_ask:
+            logger.info("[%s] %s no bid/ask → skip", slug, side)
+            return False
+        if snap.best_bid > self.cfg.max_extreme_price:
+            logger.info("[%s] %s best_bid %.4f > %.2f → settled, skip",
+                        slug, side, snap.best_bid, self.cfg.max_extreme_price)
+            return False
+        return True
 
     def _maker_price(self, snap: OrderBookSnapshot) -> float:
         """Derive a maker limit price from an orderbook snapshot."""
@@ -932,91 +839,93 @@ class TradingEngine:
 
     async def _cancel_stale_pending(self, ws: WindowState, up_price: float,
                                      down_price: float):
-        """Cancel stale pending orders from fresh (0-fill) Pairs.
+        """Cancel stale 0-fill pending orders from fresh Pairs.
 
-        Conditions:
-          Single-leg: age >= cancel_min_age (2min)
-          Two-leg:    age >= cancel_min_age (2min) OR
-                      price_dev >= cancel_replace_threshold (0.10 abs)
+        Single-leg order: cancel after cancel_min_age (default 2 min).
+        Two-leg order:   cancel after cancel_min_age OR when price moves
+                         >= cancel_replace_threshold (default 0.10).
 
-        Single-leg Pairs (one side never placed, or other side already cancelled)
-        are cancelled by time only.  Two-leg Pairs (both sides pending) can
-        also be cancelled early when price moves >= 0.10 from the order price.
-
-        Accumulate freed when BOTH sides of the Pair are done (cancelled or
-        never placed).
-
-        Excluded:
-          - Orders with remaining < min_order_size (can't re-place)
-          - Orders with any fills (let them ride)
+        Accumulate is freed when both sides of the fresh Pair are done.
         """
         min_age = self.cfg.cancel_min_age
         price_dev = self.cfg.cancel_replace_threshold
         min_qty = self.cfg.min_order_size
         now = time.time()
 
-        # Snapshot Pair info before loop — cancel() may dissolve Pairs
-        pair_snapshot = {p.pair_id: p for p in ws.pairs}
-        # Capture which Pairs are two-leg (both order_ids set) at this moment
-        two_leg_pair_ids = {
-            p.pair_id for p in ws.pairs
-            if p.up_order_id and p.down_order_id
-        }
+        # Snapshots of Pair state before loop — pair dissolve may mutate ws.pairs
+        snap = {p.pair_id: p for p in ws.pairs}
+        two_leg_ids = {p.pair_id for p in ws.pairs if p.up_order_id and p.down_order_id}
 
         for oid in list(ws.pending_orders):
             po = ws.pending_orders[oid]
-            if po.cancelled_at > 0:
+            if po.cancelled_at > 0 or po.remaining < min_qty or po.filled > 0:
                 continue
-            if po.remaining < min_qty:
-                continue
-            if po.filled > 0:
-                continue
+
+            pair = snap.get(po.pair_id) if po.pair_id else None
+            if not pair or pair.up_filled != 0 or pair.down_filled != 0:
+                continue  # not a fresh pair — let it ride
 
             age = now - po.placed_at
+            current_price = up_price if po.side == "Up" else down_price
+            is_two_leg = po.pair_id in two_leg_ids
 
-            # Look up Pair from snapshot (survives cancel dissolving it)
-            pair = pair_snapshot.get(po.pair_id) if po.pair_id else None
-            pair_is_fresh = pair is not None and pair.up_filled == 0 and pair.down_filled == 0
-            is_two_leg = po.pair_id in two_leg_pair_ids
-
-            should_cancel = False
             cancel_reason = ""
+            if age >= min_age:
+                cancel_reason = "time"
+            elif is_two_leg and abs(po.price - current_price) >= price_dev:
+                cancel_reason = "price-dev"
 
-            if pair_is_fresh:
-                current_price = up_price if po.side == "Up" else down_price
-                if age >= min_age:
-                    should_cancel = True
-                    cancel_reason = "time"
-                elif is_two_leg and abs(po.price - current_price) >= price_dev:
-                    # Two-leg only: price deviation trigger
-                    should_cancel = True
-                    cancel_reason = "price-dev"
+            if not cancel_reason:
+                continue
 
-            if should_cancel:
+            logger.info(
+                "  [cancel-%s] %s order=%s… age=%.0fs price_diff=%.4f  "
+                "pair=%s accumulate=%d",
+                cancel_reason, po.side, oid[:12], age,
+                abs(current_price - po.price), po.pair_id or "-", ws.accumulate,
+            )
+            ok, cancelled_side = await self.executor.cancel(oid)
+            if not ok or not cancelled_side:
+                continue
+
+            # ── Pair cleanup (dissolve logic moved from executor) ──
+            # Clear the cancelled order from its Pair
+            if pair.up_order_id == oid:
+                pair.up_order_id = ""
+            elif pair.down_order_id == oid:
+                pair.down_order_id = ""
+
+            # Dissolve fresh pairs: no fills on either side → remove
+            prefill_only = (
+                (pair.up_filled == pair.qty and pair.down_filled == 0)
+                or (pair.down_filled == pair.qty and pair.up_filled == 0)
+            )
+            if po.filled == 0 and prefill_only:
+                pair.up_filled = 0
+                pair.down_filled = 0
+                ws.pairs.remove(pair)
                 logger.info(
-                    "  [cancel-%s] %s order=%s… age=%.0fs price_diff=%.4f  "
-                    "pair=%s accumulate=%d",
-                    cancel_reason,
-                    po.side, oid[:12], age,
-                    abs((up_price if po.side == "Up" else down_price) - po.price),
-                    po.pair_id or "-", ws.accumulate,
+                    "  [cancel] Pair %s dissolved (order %s had no fills)",
+                    pair.pair_id, oid[:12],
                 )
-                await self.executor.cancel(oid)
+            elif pair.up_filled == 0 and pair.down_filled == 0:
+                ws.pairs.remove(pair)
+                logger.info(
+                    "  [cancel] Pair %s dissolved (no fills on either side)",
+                    pair.pair_id,
+                )
 
-                # Free accumulate when BOTH sides of this fresh Pair are done
-                if pair_is_fresh and pair:
-                    up_done = not (
-                        pair.up_order_id
-                        and pair.up_order_id in ws.pending_orders
-                        and ws.pending_orders[pair.up_order_id].cancelled_at == 0
-                    )
-                    down_done = not (
-                        pair.down_order_id
-                        and pair.down_order_id in ws.pending_orders
-                        and ws.pending_orders[pair.down_order_id].cancelled_at == 0
-                    )
-                    if up_done and down_done:
-                        ws.accumulate = max(0, ws.accumulate - pair.qty)
+            # Free accumulate when both sides of this Pair are done
+            if self._pair_both_done(pair, ws.pending_orders):
+                ws.accumulate = max(0, ws.accumulate - pair.qty)
+
+    @staticmethod
+    def _pair_both_done(pair: Pair, pending: dict[str, PendingOrder]) -> bool:
+        """Return True if neither side of the pair has an active pending order."""
+        def _side_active(order_id: str) -> bool:
+            return (order_id and order_id in pending
+                    and pending[order_id].cancelled_at == 0)
+        return not _side_active(pair.up_order_id) and not _side_active(pair.down_order_id)
 
     # ── Order execution ──
 
@@ -1029,95 +938,196 @@ class TradingEngine:
         )
         return oid is not None
 
+    # ── Tick helpers ──
+
+    @staticmethod
+    def _log_pending_state(slug: str, ws: WindowState):
+        """Log active pending orders grouped by side."""
+        for side in ("Up", "Down"):
+            active = [po for po in ws.pending_orders.values()
+                      if po.side == side and po.cancelled_at == 0]
+            if active:
+                prices = {po.order_id[:8]: f"{po.price:.4f}" for po in active}
+                logger.info("  [%s] Pending %s: %d orders  prices=%s  inv=%d",
+                            slug, side, len(active), prices, ws.inventory[side])
+
+    async def _place_step3_pair(self, market: MarketInfo, ws: WindowState,
+                                 step3: list[Decision]) -> bool:
+        """Place a new Up+Down pair — sign both, submit together. Returns True if any side OK."""
+        up_d = next((d for d in step3 if d.side == "Up"), None)
+        down_d = next((d for d in step3 if d.side == "Down"), None)
+        if up_d is None or down_d is None:
+            logger.warning("step3 pair missing side: Up=%s Down=%s", up_d, down_d)
+            return False
+
+        pair = Pair(
+            pair_id=f"pair_{ws.window_num}_{len(ws.pairs)}",
+            up_price=up_d.price, down_price=down_d.price, qty=up_d.amount,
+        )
+        ws.pairs.append(pair)
+        up_d.pair_id = pair.pair_id
+        down_d.pair_id = pair.pair_id
+
+        up_ok, down_ok = await self.executor.place_pair(
+            market.slug, market.up_token_id, market.down_token_id,
+            up_d.price, up_d.amount, down_d.price, down_d.amount,
+            pair_id=up_d.pair_id,
+        )
+
+        if up_ok or down_ok:
+            ws.accumulate += up_d.amount
+        logger.info("  [engine] step3 accumulate=%d  (%s/%s)  pair=%s",
+                    ws.accumulate,
+                    "Up" if up_ok else "-", "Down" if down_ok else "-",
+                    pair.pair_id)
+        return up_ok or down_ok
+
+    async def _handle_cancel_replace(self, d: Decision, ws: WindowState):
+        """Cancel the old blocking order and clear pair state (no dissolve)."""
+        old_po = ws.pending_orders.get(d.cancel_order_id)
+        if not old_po or old_po.cancelled_at > 0:
+            return
+        await self.sdk.cancel_order(d.cancel_order_id)
+        old_po.cancelled_at = time.time()
+        # Clear pair's order_id so new order can link
+        for p in ws.pairs:
+            if p.pair_id == d.pair_id:
+                if d.side == "Up":
+                    p.up_order_id = ""
+                else:
+                    p.down_order_id = ""
+                break
+        del ws.pending_orders[d.cancel_order_id]
+        logger.info("  [engine] cancel-replace %s… → new %s order",
+                    d.cancel_order_id[:12], d.side)
+
+    async def _place_step2_repair(self, market: MarketInfo, ws: WindowState,
+                                   repairs: list[Decision]) -> bool:
+        """Place individual repair orders. Returns True if any placed successfully."""
+        any_ok = False
+        for d in repairs:
+            if d.cancel_order_id:
+                await self._handle_cancel_replace(d, ws)
+            token_id = market.up_token_id if d.side == "Up" else market.down_token_id
+            ok = await self._place_order(
+                market.slug, token_id, d.side, d.price, d.amount,
+                pair_id=d.pair_id,
+            )
+            if ok:
+                any_ok = True
+        return any_ok
+
+    @staticmethod
+    def _log_tick_timing(tick_count: int, t_wake: float, t_priced: float,
+                         t_decided: float, t_emitted: float, t_placed: float,
+                         decisions: list[Decision], ws: WindowState):
+        """Log compact single-line tick timing summary."""
+        dt_price  = (t_priced   - t_wake)    * 1000
+        dt_decide = (t_decided  - t_priced)   * 1000
+        dt_emit   = (t_emitted  - t_decided)  * 1000
+        dt_place  = (t_placed   - t_emitted)  * 1000
+        dt_total  = (t_placed   - t_wake)     * 1000
+        logger.info(
+            "  ⏱ tick#%d total=%.1fms (price=%.1fms decide=%.1fms emit=%.1fms place=%.1fms) "
+            "decisions=%d pending=%d inv=U%d/D%d",
+            tick_count, dt_total, dt_price, dt_decide, dt_emit, dt_place,
+            len(decisions), len(ws.pending_orders),
+            ws.inventory["Up"], ws.inventory["Down"],
+        )
+
     # ── Settlement ──
 
-    async def _settle_window(self, win_num: int, ws: WindowState, market: MarketInfo) -> Optional[float]:
+    async def _settle_window(self, win_num: int, ws: WindowState,
+                             market: MarketInfo) -> Optional[float]:
         """Settle and return PnL (None if winner unknown)."""
         logger.info("  [%s] Window ended → settling…", market.slug)
 
-        # Cancel remaining pending orders
         await self.executor.cancel_all(ws.pending_orders)
         ws.pending_orders.clear()
 
-        winner = None
-
-        # Tier 1: Gamma API — retry longer for oracle to resolve
-        for attempt in range(10):
-            winner = await self.sdk.get_resolved_winner(market.slug)
-            if winner is not None:
-                logger.info("  [%s] API resolved winner: %s (attempt %d)", market.slug, winner, attempt + 1)
-                break
-            await asyncio.sleep(3)
-
-        # Tier 2: Last trade price from Gamma Data API
-        if winner is None:
-            logger.warning("  [%s] API not resolved, querying last trade prices…", market.slug)
-            try:
-                import httpx
-                url = "https://data-api.polymarket.com/trades"
-                params = {"market": market.condition_id, "limit": 100}
-                async with httpx.AsyncClient() as client:
-                    resp = await client.get(url, params=params, timeout=10)
-                    if resp.status_code == 200:
-                        trades = resp.json()
-                        if trades:
-                            # Use last trade of each outcome
-                            last_up = 0.0
-                            last_down = 0.0
-                            for t in trades:
-                                ts = int(t.get("timestamp", 0))
-                                price = float(t.get("price", 0))
-                                if t.get("asset", "") == market.up_token_id or t.get("outcome") == "Up":
-                                    last_up = price
-                                elif t.get("asset", "") == market.down_token_id or t.get("outcome") == "Down":
-                                    last_down = price
-                            if last_up >= 0.99 and last_down <= 0.01:
-                                winner = "Up"
-                                logger.info("  [%s] Trades resolved: Up=%.4f Down=%.4f → %s",
-                                            market.slug, last_up, last_down, winner)
-                            elif last_down >= 0.99 and last_up <= 0.01:
-                                winner = "Down"
-                                logger.info("  [%s] Trades resolved: Up=%.4f Down=%.4f → %s",
-                                            market.slug, last_up, last_down, winner)
-                            else:
-                                logger.info("  [%s] Trades ambiguous: Up=%.4f Down=%.4f → fallback",
-                                            market.slug, last_up, last_down)
-            except Exception as e:
-                logger.warning("  [%s] Trades API error: %s", market.slug, e)
-
-        # Tier 3: WS midpoint as last resort
-        if winner is None:
-            logger.warning("  [%s] Using WS midpoint as last resort", market.slug)
-            up_snap = self.prices.get(market.up_token_id)
-            down_snap = self.prices.get(market.down_token_id)
-            up_mid = up_snap.mid_price if up_snap else None
-            down_mid = down_snap.mid_price if down_snap else None
-            if up_mid and down_mid:
-                if up_mid > 0.75:
-                    winner = "Up"
-                elif up_mid < 0.25:
-                    winner = "Down"
-                elif up_mid > 0.65 and down_mid < 0.35:
-                    winner = "Up"
-                elif down_mid > 0.65 and up_mid < 0.35:
-                    winner = "Down"
-                elif up_mid > down_mid:
-                    winner = "Up"
-                elif down_mid > up_mid:
-                    winner = "Down"
-
+        winner = await self._resolve_winner(market)
         rpt = ws.report(winner=winner)
-        pnl = rpt.get("pnl")  # None if no winner
+        pnl = rpt.get("pnl")
         self._cum_pnl += pnl or 0.0
 
         await self._emit("window_end", WindowEnd(
-            window_num=win_num,
-            slug=market.slug,
-            report=rpt,
-            cum_pnl=round(self._cum_pnl, 2),
+            window_num=win_num, slug=market.slug,
+            report=rpt, cum_pnl=round(self._cum_pnl, 2),
         ))
-
         return pnl
+
+    async def _resolve_winner(self, market: MarketInfo) -> Optional[str]:
+        """Resolve market winner via 3-tier fallback: API → trades → WS midpoint."""
+        # Tier 1: Gamma API (retry up to 30s for oracle to resolve)
+        for attempt in range(10):
+            winner = await self.sdk.get_resolved_winner(market.slug)
+            if winner:
+                logger.info("  [%s] API resolved winner: %s (attempt %d)",
+                            market.slug, winner, attempt + 1)
+                return winner
+            await asyncio.sleep(3)
+
+        # Tier 2: Last trade prices from data API
+        winner = await self._resolve_winner_from_trades(market)
+        if winner:
+            return winner
+
+        # Tier 3: WS midpoint as last resort
+        return self._resolve_winner_from_midpoint(market)
+
+    async def _resolve_winner_from_trades(self, market: MarketInfo) -> Optional[str]:
+        """Try to determine winner from the last trade of each outcome token."""
+        logger.warning("  [%s] API not resolved, querying last trade prices…", market.slug)
+        try:
+            import httpx
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    "https://data-api.polymarket.com/trades",
+                    params={"market": market.condition_id, "limit": 100},
+                    timeout=10,
+                )
+                if resp.status_code != 200:
+                    return None
+                trades = resp.json()
+                if not trades:
+                    return None
+
+                last_up = 0.0
+                last_down = 0.0
+                for t in trades:
+                    if t.get("asset", "") == market.up_token_id or t.get("outcome") == "Up":
+                        last_up = float(t.get("price", 0))
+                    elif t.get("asset", "") == market.down_token_id or t.get("outcome") == "Down":
+                        last_down = float(t.get("price", 0))
+
+                if last_up >= 0.99 and last_down <= 0.01:
+                    logger.info("  [%s] Trades: Up=%.4f Down=%.4f → Up", market.slug, last_up, last_down)
+                    return "Up"
+                if last_down >= 0.99 and last_up <= 0.01:
+                    logger.info("  [%s] Trades: Up=%.4f Down=%.4f → Down", market.slug, last_up, last_down)
+                    return "Down"
+                logger.info("  [%s] Trades ambiguous: Up=%.4f Down=%.4f", market.slug, last_up, last_down)
+        except Exception as e:
+            logger.warning("  [%s] Trades API error: %s", market.slug, e)
+        return None
+
+    def _resolve_winner_from_midpoint(self, market: MarketInfo) -> Optional[str]:
+        """Determine winner from WS midpoints — heuristic last resort."""
+        logger.warning("  [%s] Using WS midpoint as last resort", market.slug)
+        up_snap = self.prices.get(market.up_token_id)
+        down_snap = self.prices.get(market.down_token_id)
+        up_mid = up_snap.mid_price if up_snap else None
+        down_mid = down_snap.mid_price if down_snap else None
+        if not up_mid or not down_mid:
+            return None
+        # Descending confidence thresholds
+        if up_mid > 0.75:       return "Up"
+        if up_mid < 0.25:       return "Down"
+        if up_mid > 0.65 and down_mid < 0.35:  return "Up"
+        if down_mid > 0.65 and up_mid < 0.35:  return "Down"
+        if up_mid > down_mid:   return "Up"
+        if down_mid > up_mid:   return "Down"
+        return None
 
     # ════════════════════════════════════════════════════════════
     # Info

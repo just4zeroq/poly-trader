@@ -85,11 +85,6 @@ class Config:
     """Minimum price gap to place another order on the same side. If the current tick's
     maker price is within this distance of any existing pending order, skip that side.
     Prevents stacking multiple orders at nearly identical prices."""
-    max_unpaired_backlog: int = field(default_factory=lambda: _env_int("max_unpaired_backlog", 2))
-    """Max unpaired lot count before step 3 stops opening new pairs.
-    Step 3 opens a fresh Up+Down pair only when
-    max(unpaired_up_lots, unpaired_down_lots) < this value.
-    Prevents new orders from accumulating too many unmatched lots."""
     max_single_leg_pairs: int = field(default_factory=lambda: _env_int("max_single_leg_pairs", 1))
     """Max single-leg Pairs allowed before step 3 is blocked.
     After step 2 fusion+repair, if remaining single-leg Pairs >= this,

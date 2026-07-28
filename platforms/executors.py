@@ -313,19 +313,11 @@ class LiveExecutor(OrderExecutor):
 
         return up_ok, down_ok
 
-    async def cancel(self, order_id: str) -> bool:
-        """Soft-delete: mark cancelled_at instead of deleting immediately.
+    async def cancel(self, order_id: str) -> tuple[bool, str | None]:
+        """Soft-delete: mark cancelled_at, emit event.
 
-        SDK cancel_order returning True means the CLOB accepted the cancel
-        request.  The fill may still be in-flight — UserTradeEvent could
-        arrive after this returns.  By keeping the order in pending_orders
-        with cancelled_at set, _handle_trade can still match it and correctly
-        update inventory/cost.  flush_cancelled() removes them after the
-        grace period.
-
-        Also cleans up the Pair object: clears the cancelled order_id.
-        Dissolves the Pair if the cancelled order never filled and the Pair
-        only has pre-filled inventory (no real fills from the other side).
+        Returns (ok, side) — side is "Up"/"Down" for the caller (engine) to
+        clean up Pair state.  Pair dissolve is the engine's responsibility.
         """
         ok = await self.engine.sdk.cancel_order(order_id)
         if ok:
@@ -334,45 +326,14 @@ class LiveExecutor(OrderExecutor):
                 if po is None:
                     continue
                 po.cancelled_at = time.time()
-
-                # Clear the cancelled order from its Pair
-                pair = self._find_pair_for_order(ws, po)
-                if pair:
-                    if pair.up_order_id == order_id:
-                        pair.up_order_id = ""
-                    elif pair.down_order_id == order_id:
-                        pair.down_order_id = ""
-
-                    # Dissolve if the cancelled order never filled and the
-                    # Pair only has pre-fill on one side (step2 prefill pattern).
-                    prefill_only = (
-                        (pair.up_filled == pair.qty and pair.down_filled == 0)
-                        or (pair.down_filled == pair.qty and pair.up_filled == 0)
-                    )
-                    if po.filled == 0 and prefill_only:
-                        # Prefilled inventory reverts to unpaired — no lot surgery needed
-                        pair.up_filled = 0
-                        pair.down_filled = 0
-                        ws.pairs.remove(pair)
-                        logger.info(
-                            "  [cancel] Pair %s dissolved (order %s had no fills)",
-                            pair.pair_id, order_id[:12],
-                        )
-                    elif pair.up_filled == 0 and pair.down_filled == 0:
-                        ws.pairs.remove(pair)
-                        logger.info(
-                            "  [cancel] Pair %s dissolved (no fills on either side)",
-                            pair.pair_id,
-                        )
-
                 await self.engine._emit("order_cancelled", OrderCancelled(
                     window_num=ws.window_num,
                     outcome=po.side, amount=po.remaining,
                     price=po.price, order_id=order_id,
                 ))
-                return True
+                return True, po.side
         logger.warning("  [cancel] SDK cancel_order(%s…) FAILED", order_id[:12])
-        return ok
+        return ok, None
 
     async def cancel_all(self, pending_orders: dict[str, PendingOrder]):
         """Soft-cancel all pending orders, wait for in-flight fills, then flush."""
@@ -522,7 +483,7 @@ class LiveExecutor(OrderExecutor):
                 # Only warn if not in orphan buffer already (first time)
                 if len(self._orphan_fills) <= 50:
                     logger.warning(
-                        "  [fill] UNMATCHED fill for unknown order=%s… "
-                        "size=%d price=%.4f  (buffered as orphan)",
+                        "  [fill] ORPHAN order=%s… size=%d price=%.4f  "
+                        "(may be post-cancel_all late fill, buffered for analysis)",
                         oid[:12], fill_size, fill_price,
                     )

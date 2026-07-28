@@ -9,6 +9,7 @@ Each tick:
 
 from __future__ import annotations
 import logging
+import time
 
 from .config import Config
 from .models import Decision, Pair, WindowState
@@ -62,6 +63,8 @@ class MakerStrategy:
 
         exposure_up = inv_up + pending_up
         exposure_down = inv_down + pending_down
+        # Computed before _fuse_pairs — fusion only reorganizes existing Pairs
+        # (no new positions), so these values are still accurate in step3.
 
         # ════════════════════════════════════════════
         # Step 1: Fuse single-leg Pairs into two-leg
@@ -276,7 +279,6 @@ class MakerStrategy:
                     blocker = po
                     break
 
-            import time
             cancel_replace_min_age = 30.0  # min age before cancel-replace kicks in
             if blocker is not None:
                 if blocker.filled == 0 and (time.time() - blocker.placed_at) >= cancel_replace_min_age:
