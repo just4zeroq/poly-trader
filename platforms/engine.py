@@ -746,22 +746,22 @@ class TradingEngine:
 
             # ── Place orders, track success/failure ──
             tick_any_ok = False
-            if len(decisions) == 2:
-                # Both sides → sign together, submit together
-                up_d = next(d for d in decisions if d.side == "Up")
-                down_d = next(d for d in decisions if d.side == "Down")
+            step3_new = [d for d in decisions if not d.pair_id]
+            step2_repair = [d for d in decisions if d.pair_id]
 
-                # Step3 decisions have no pair_id → engine manages Pair lifecycle
-                is_step3 = not up_d.pair_id
-                if is_step3:
-                    # Pre-create Pair for order ID linking in place_pair()
-                    pair = Pair(
-                        pair_id=f"pair_{ws_state.window_num}_{len(ws_state.pairs)}",
-                        up_price=up_d.price, down_price=down_d.price, qty=up_d.amount,
-                    )
-                    ws_state.pairs.append(pair)
-                    up_d.pair_id = pair.pair_id
-                    down_d.pair_id = pair.pair_id
+            if step3_new:
+                # Step 3: new Up+Down pair — sign together, submit together
+                up_d = next(d for d in step3_new if d.side == "Up")
+                down_d = next(d for d in step3_new if d.side == "Down")
+
+                # Pre-create Pair for order ID linking in place_pair()
+                pair = Pair(
+                    pair_id=f"pair_{ws_state.window_num}_{len(ws_state.pairs)}",
+                    up_price=up_d.price, down_price=down_d.price, qty=up_d.amount,
+                )
+                ws_state.pairs.append(pair)
+                up_d.pair_id = pair.pair_id
+                down_d.pair_id = pair.pair_id
 
                 up_ok, down_ok = await self.executor.place_pair(
                     market.slug,
@@ -771,22 +771,24 @@ class TradingEngine:
                     pair_id=up_d.pair_id,
                 )
 
-                if is_step3:
-                    if up_ok or down_ok:
-                        ws_state.accumulate += up_d.amount
-                    logger.info(
-                        "  [engine] step3 accumulate=%d  (%s/%s)  pair=%s",
-                        ws_state.accumulate,
-                        "Up" if up_ok else "-", "Down" if down_ok else "-",
-                        pair.pair_id,
-                    )
-
+                if up_ok or down_ok:
+                    ws_state.accumulate += up_d.amount
+                logger.info(
+                    "  [engine] step3 accumulate=%d  (%s/%s)  pair=%s",
+                    ws_state.accumulate,
+                    "Up" if up_ok else "-", "Down" if down_ok else "-",
+                    pair.pair_id,
+                )
                 tick_any_ok = up_ok or down_ok
-            else:
-                # Single side → use existing individual placement
-                for d in decisions:
+
+            if step2_repair:
+                # Step 2: individual orders for existing single-leg Pairs
+                for d in step2_repair:
                     token_id = market.up_token_id if d.side == "Up" else market.down_token_id
-                    ok = await self._place_order(market.slug, token_id, d.side, d.price, d.amount, pair_id=d.pair_id)
+                    ok = await self._place_order(
+                        market.slug, token_id, d.side, d.price, d.amount,
+                        pair_id=d.pair_id,
+                    )
                     if ok:
                         tick_any_ok = True
 

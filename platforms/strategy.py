@@ -32,7 +32,15 @@ class MakerStrategy:
         down_price: float,
         remaining_time: float = 999,
     ) -> list[Decision]:
-        """Produce 0-2 buy decisions for this tick."""
+        """Produce buy decisions for this tick.
+
+        Steps:
+          1. Fuse single-leg Pairs into two-leg (maximize matching)
+          2. Repair remaining single-leg Pairs — place missing side
+          3. If step2 placed orders → skip step3.
+             Else if single-leg count >= max_single_leg_pairs → skip step3.
+             Else normal new pair.
+        """
         decisions: list[Decision] = []
         cfg = self.cfg
 
@@ -56,16 +64,27 @@ class MakerStrategy:
         exposure_down = inv_down + pending_down
 
         # ════════════════════════════════════════════
-        # Step 1: Fuse single-leg Pairs into two-leg Pairs
+        # Step 1: Fuse single-leg Pairs into two-leg
         # ════════════════════════════════════════════
         self._fuse_pairs(ws)
 
         # ════════════════════════════════════════════
-        # Step 2: Pair order to cover inventory imbalance
+        # Step 2: Repair remaining single-leg Pairs
         # ════════════════════════════════════════════
-        placed_pair = self._step2_pair_order(ws, up_price, down_price)
-        if placed_pair:
-            return placed_pair
+        decisions = self._step2_repair(ws, up_price, down_price)
+        if decisions:
+            return decisions  # step2 placed → skip step3
+
+        # ════════════════════════════════════════════
+        # Step 3 gate: too many single-leg Pairs
+        # ════════════════════════════════════════════
+        single_cnt = self._count_single_legs(ws)
+        if single_cnt >= cfg.max_single_leg_pairs:
+            logger.info(
+                "  [step3] %d single-leg Pairs >= %d → skip (accumulate=%d)",
+                single_cnt, cfg.max_single_leg_pairs, ws.accumulate,
+            )
+            return decisions
 
         # ════════════════════════════════════════════
         # Step 3: New pair — normal market making
@@ -167,92 +186,112 @@ class MakerStrategy:
             logger.info("  [fuse] Matched %d pairs  accumulate=%d", matched, ws.accumulate)
 
     # ──────────────────────────────────────────────
-    # Step 2: Pair order to re-balance inventory
+    # Step 2: Repair single-leg Pairs
     # ──────────────────────────────────────────────
 
-    def _step2_pair_order(
+    def _leg_is_active(self, pair: Pair, side: str, pending: dict) -> bool:
+        """Check if a Pair's side has active fills or pending orders."""
+        if side == "Up":
+            return (
+                pair.up_filled > 0
+                or (pair.up_order_id
+                    and pair.up_order_id in pending
+                    and pending[pair.up_order_id].cancelled_at == 0)
+            )
+        return (
+            pair.down_filled > 0
+            or (pair.down_order_id
+                and pair.down_order_id in pending
+                and pending[pair.down_order_id].cancelled_at == 0)
+        )
+
+    def _is_single_leg(self, pair: Pair, pending: dict[str, ...]) -> bool:
+        """True if this Pair has exactly one active leg."""
+        has_up = self._leg_is_active(pair, "Up", pending)
+        has_down = self._leg_is_active(pair, "Down", pending)
+        return has_up != has_down  # XOR
+
+    def _count_single_legs(self, ws: WindowState) -> int:
+        """Count Pairs with exactly one active leg."""
+        pending = ws.pending_orders
+        return sum(1 for p in ws.pairs if self._is_single_leg(p, pending))
+
+    def _step2_repair(
         self, ws: WindowState,
         up_price: float, down_price: float,
-    ) -> list[Decision] | None:
-        """Place a pair order to re-balance inventory.
+    ) -> list[Decision]:
+        """Repair single-leg Pairs — place the missing side.
 
-        Uses inventory-level imbalance (inv_up - paired_up vs inv_down - paired_down)
-        instead of lot-level tracking.  Cost check uses heavy side avg cost.
+        After step1 fusion, remaining single-leg Pairs are ones that
+        couldn't be fused (no compatible opposite-leg Pair).  Place a
+        single order on the missing side with:
+          - Cost check:  existing_lock_price + market_price < pair_cost_max
+          - Min gap:     market price not too close to pending orders
+          - Qty:         min_order_size
 
-        Returns a decision list or None to fall through to step 3.
+        Returns list of decisions (each with pair_id).  If non-empty,
+        engine places them individually (not batch pair).
         """
+        decisions: list[Decision] = []
         cfg = self.cfg
-
-        unpaired_up = ws.unpaired_up
-        unpaired_down = ws.unpaired_down
-
-        if unpaired_up == 0 and unpaired_down == 0:
-            return None
-
-        # Determine which side to buy
-        if unpaired_up > unpaired_down:
-            pair_side = "Down"
-            price = down_price
-            heavy_avg = ws.avg_cost_up
-            prefill_side = "Up"
-        elif unpaired_down > unpaired_up:
-            pair_side = "Up"
-            price = up_price
-            heavy_avg = ws.avg_cost_down
-            prefill_side = "Down"
-        else:
-            # Balanced — nothing to do
-            return None
-
-        if price <= 0:
-            return None
-
-        # Cost check: heavy side avg + current price <= pair_cost_max
-        if heavy_avg + price > cfg.pair_cost_max:
-            logger.info(
-                "  [pair_order] Cost too high: %s avg=%.4f + %s price=%.4f > %.2f → skip",
-                prefill_side, heavy_avg, pair_side, price, cfg.pair_cost_max,
-            )
-            return None
-
-        # Min gap
-        too_close = any(
-            abs(po.price - price) < cfg.min_price_gap
-            for po in ws.pending_orders.values()
-            if po.side == pair_side and po.cancelled_at == 0
-        )
-        if too_close:
-            logger.info(
-                "  [pair_order] %s price %.4f too close to pending (min_gap=%.4f) → skip",
-                pair_side, price, cfg.min_price_gap,
-            )
-            return None
-
-        # Place order: prefill heavy side with unpaired excess
+        pending = ws.pending_orders
         qty = cfg.min_order_size
-        excess = abs(unpaired_up - unpaired_down)
-        prefill_qty = min(excess, qty)
 
-        logger.info(
-            "  [pair_order] %s %d @ %.4f  (heavy=%s unpaired=%d avg=%.4f  prefill=%d)",
-            pair_side, qty, price, prefill_side,
-            excess, heavy_avg, prefill_qty,
-        )
+        for pair in list(ws.pairs):
+            has_up = self._leg_is_active(pair, "Up", pending)
+            has_down = self._leg_is_active(pair, "Down", pending)
 
-        # Create Pair, prefill heavy side from existing inventory
-        pair = Pair(
-            pair_id=f"pair_{ws.window_num}_{len(ws.pairs)}",
-            up_price=up_price if pair_side == "Up" else price,
-            down_price=down_price if pair_side == "Down" else price,
-            qty=qty,
-        )
-        if prefill_side == "Up":
-            pair.up_filled = prefill_qty
-        else:
-            pair.down_filled = prefill_qty
-        ws.pairs.append(pair)
+            if has_up and has_down:
+                continue  # already two-leg
+            if not has_up and not has_down:
+                continue  # dead Pair
+            # ── single-leg from here ──
+            if has_up and not has_down:
+                # Missing Down side
+                if pair.up_price + down_price >= cfg.pair_cost_max:
+                    logger.info(
+                        "  [repair] Pair %s cost %.4f + %.4f = %.4f >= %.2f → skip Down",
+                        pair.pair_id, pair.up_price, down_price,
+                        pair.up_price + down_price, cfg.pair_cost_max,
+                    )
+                    continue
+                side, price = "Down", down_price
+            else:  # not has_up and has_down
+                # Missing Up side
+                if up_price + pair.down_price >= cfg.pair_cost_max:
+                    logger.info(
+                        "  [repair] Pair %s cost %.4f + %.4f = %.4f >= %.2f → skip Up",
+                        pair.pair_id, up_price, pair.down_price,
+                        up_price + pair.down_price, cfg.pair_cost_max,
+                    )
+                    continue
+                side, price = "Up", up_price
 
-        return [Decision(side=pair_side, amount=qty, price=price, pair_id=pair.pair_id)]
+            # Min gap check
+            too_close = any(
+                abs(po.price - price) < cfg.min_price_gap
+                for po in pending.values()
+                if po.side == side and po.cancelled_at == 0
+            )
+            if too_close:
+                logger.info(
+                    "  [repair] Pair %s %s price %.4f too close → skip",
+                    pair.pair_id, side, price,
+                )
+                continue
+
+            decisions.append(Decision(
+                side=side, amount=qty, price=price,
+                pair_id=pair.pair_id,
+            ))
+            logger.info(
+                "  [repair] Pair %s missing %s → %d @ %.4f  cost=%.4f",
+                pair.pair_id, side, qty, price,
+                (pair.up_price + down_price)
+                if side == "Down" else (up_price + pair.down_price),
+            )
+
+        return decisions
 
     # ──────────────────────────────────────────────
     # Step 3: Normal logic — per-side independent orders
