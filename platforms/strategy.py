@@ -388,10 +388,13 @@ class MakerStrategy:
             return decisions
 
         # ── Pair cost cap ──
-        if up_price + down_price > cfg.pair_cost_max:
+        cost_cap = cfg.pair_cost_max
+        if 0.40 <= up_price <= 0.60 and 0.40 <= down_price <= 0.60:
+            cost_cap = min(cost_cap, cfg.pair_cost_mid)
+        if up_price + down_price > cost_cap:
             logger.info(
                 "  [step3] Pair cost %.4f > %.2f → skip (would lock loss)",
-                up_price + down_price, cfg.pair_cost_max,
+                up_price + down_price, cost_cap,
             )
             return decisions
 

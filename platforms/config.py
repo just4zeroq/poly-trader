@@ -78,6 +78,9 @@ class Config:
     pair_cost_max: float = field(default_factory=lambda: _env_float("pair_cost_max", 1.0))
     """Max cost for a paired order (up_price + down_price). New pairs and re-pairs
     skip when cost exceeds this threshold.  1.0 = break-even."""
+    pair_cost_mid: float = field(default_factory=lambda: _env_float("pair_cost_mid", 0.97))
+    """Tighter cost cap when both prices are in the 0.40–0.60 mid-range,
+    where the edge is thinner.  Applies to step3 new pairs only."""
     max_per_side: int = field(default_factory=lambda: _env_int("max_per_side", 20))
     aggressiveness: float = field(default_factory=lambda: _env_float("aggressiveness", 0.3))
     """Aggressiveness 0-1 — higher = more aggressive pricing (closer to best_ask)."""
