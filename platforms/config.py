@@ -81,7 +81,6 @@ class Config:
     max_per_side: int = field(default_factory=lambda: _env_int("max_per_side", 20))
     aggressiveness: float = field(default_factory=lambda: _env_float("aggressiveness", 0.3))
     """Aggressiveness 0-1 — higher = more aggressive pricing (closer to best_ask)."""
-    cancel_replace_threshold: float = field(default_factory=lambda: _env_float("cancel_replace_threshold", 10.0))
     min_price_gap: float = field(default_factory=lambda: _env_float("min_price_gap", 0.02))
     """Minimum price gap to place another order on the same side. If the current tick's
     maker price is within this distance of any existing pending order, skip that side.
@@ -110,8 +109,12 @@ class Config:
     stop_on_window_loss: bool = field(default_factory=lambda: _env_bool("stop_on_window_loss", True))
 
     # ── Cancel-replace ──
-    cancel_min_age: float = field(default_factory=lambda: _env_float("cancel_min_age", 180.0))
-    """Minimum seconds a pending order must live before price-based cancel considers it."""
+    cancel_min_age: float = field(default_factory=lambda: _env_float("cancel_min_age", 120.0))
+    """Age threshold (seconds) for cancel. Single-leg: cancel + free accumulate.
+    Two-leg: cancel by time, or early if price deviates >= cancel_replace_threshold."""
+    cancel_replace_threshold: float = field(default_factory=lambda: _env_float("cancel_replace_threshold", 0.10))
+    """Absolute price deviation threshold for early cancel of two-leg Pairs.
+    E.g. 0.10 means cancel if current price differs from order price by >= 0.10."""
     cancel_max_age: float = field(default_factory=lambda: _env_float("cancel_max_age", 600.0))
     """Maximum seconds a pending order can live — force-cancel regardless of price."""
     min_remaining_time: float = field(default_factory=lambda: _env_float("min_remaining_time", 180.0))

@@ -45,6 +45,7 @@ from .models import (
     OrderFailed,
     OrderFilled,
     OrderPlaced,
+    Pair,
     PendingOrder,
     PriceLevel,
     TickEvent,
@@ -749,12 +750,37 @@ class TradingEngine:
                 # Both sides → sign together, submit together
                 up_d = next(d for d in decisions if d.side == "Up")
                 down_d = next(d for d in decisions if d.side == "Down")
+
+                # Step3 decisions have no pair_id → engine manages Pair lifecycle
+                is_step3 = not up_d.pair_id
+                if is_step3:
+                    # Pre-create Pair for order ID linking in place_pair()
+                    pair = Pair(
+                        pair_id=f"pair_{ws_state.window_num}_{len(ws_state.pairs)}",
+                        up_price=up_d.price, down_price=down_d.price, qty=up_d.amount,
+                    )
+                    ws_state.pairs.append(pair)
+                    up_d.pair_id = pair.pair_id
+                    down_d.pair_id = pair.pair_id
+
                 up_ok, down_ok = await self.executor.place_pair(
                     market.slug,
                     market.up_token_id, market.down_token_id,
                     up_d.price, up_d.amount,
                     down_d.price, down_d.amount,
+                    pair_id=up_d.pair_id,
                 )
+
+                if is_step3:
+                    if up_ok or down_ok:
+                        ws_state.accumulate += up_d.amount
+                    logger.info(
+                        "  [engine] step3 accumulate=%d  (%s/%s)  pair=%s",
+                        ws_state.accumulate,
+                        "Up" if up_ok else "-", "Down" if down_ok else "-",
+                        pair.pair_id,
+                    )
+
                 tick_any_ok = up_ok or down_ok
             else:
                 # Single side → use existing individual placement
@@ -884,19 +910,37 @@ class TradingEngine:
 
     async def _cancel_stale_pending(self, ws: WindowState, up_price: float,
                                      down_price: float):
-        """Cancel pending orders on time or price deviation, whichever comes first.
+        """Cancel stale pending orders from fresh (0-fill) Pairs.
 
-        Two independent triggers (OR):
-          - Time-based:  age >= cancel_max_age  → force cancel
-          - Price-based: age >= cancel_min_age AND deviation > threshold → cancel
+        Conditions:
+          Single-leg: age >= cancel_min_age (2min)
+          Two-leg:    age >= cancel_min_age (2min) OR
+                      price_dev >= cancel_replace_threshold (0.10 abs)
 
-        Orders with remaining < min_order_size are excluded (can't re-place).
+        Single-leg Pairs (one side never placed, or other side already cancelled)
+        are cancelled by time only.  Two-leg Pairs (both sides pending) can
+        also be cancelled early when price moves >= 0.10 from the order price.
+
+        Accumulate freed when BOTH sides of the Pair are done (cancelled or
+        never placed).
+
+        Excluded:
+          - Orders with remaining < min_order_size (can't re-place)
+          - Orders with any fills (let them ride)
         """
-        threshold = self.cfg.cancel_replace_threshold
         min_age = self.cfg.cancel_min_age
-        max_age = self.cfg.cancel_max_age
+        price_dev = self.cfg.cancel_replace_threshold
         min_qty = self.cfg.min_order_size
         now = time.time()
+
+        # Snapshot Pair info before loop — cancel() may dissolve Pairs
+        pair_snapshot = {p.pair_id: p for p in ws.pairs}
+        # Capture which Pairs are two-leg (both order_ids set) at this moment
+        two_leg_pair_ids = {
+            p.pair_id for p in ws.pairs
+            if p.up_order_id and p.down_order_id
+        }
+
         for oid in list(ws.pending_orders):
             po = ws.pending_orders[oid]
             if po.cancelled_at > 0:
@@ -904,31 +948,53 @@ class TradingEngine:
             if po.remaining < min_qty:
                 continue
             if po.filled > 0:
-                continue  # partial fill — don't cancel, let it ride
-
-            age = now - po.placed_at
-            current_price = up_price if po.side == "Up" else down_price
-            deviation = abs(po.price - current_price) / max(po.price, 0.001)
-
-            # Time-based trigger
-            if age >= max_age:
-                logger.info(
-                    "  [cancel-time] %s order=%s… age=%.0fs >= max=%.0fs  "
-                    "price=%.4f dev=%.1f%%",
-                    po.side, oid[:12], age, max_age, po.price, deviation * 100,
-                )
-                await self.executor.cancel(oid)
                 continue
 
-            # Price-based trigger
-            if age >= min_age and deviation > threshold:
+            age = now - po.placed_at
+
+            # Look up Pair from snapshot (survives cancel dissolving it)
+            pair = pair_snapshot.get(po.pair_id) if po.pair_id else None
+            pair_is_fresh = pair is not None and pair.up_filled == 0 and pair.down_filled == 0
+            is_two_leg = po.pair_id in two_leg_pair_ids
+
+            should_cancel = False
+            cancel_reason = ""
+
+            if pair_is_fresh:
+                current_price = up_price if po.side == "Up" else down_price
+                if age >= min_age:
+                    should_cancel = True
+                    cancel_reason = "time"
+                elif is_two_leg and abs(po.price - current_price) >= price_dev:
+                    # Two-leg only: price deviation trigger
+                    should_cancel = True
+                    cancel_reason = "price-dev"
+
+            if should_cancel:
                 logger.info(
-                    "  [cancel-price] %s order=%s… old=%.4f new=%.4f "
-                    "dev=%.1f%% thresh=%.0f%% age=%.0fs",
-                    po.side, oid[:12], po.price, current_price,
-                    deviation * 100, threshold * 100, age,
+                    "  [cancel-%s] %s order=%s… age=%.0fs price_diff=%.4f  "
+                    "pair=%s accumulate=%d",
+                    cancel_reason,
+                    po.side, oid[:12], age,
+                    abs((up_price if po.side == "Up" else down_price) - po.price),
+                    po.pair_id or "-", ws.accumulate,
                 )
                 await self.executor.cancel(oid)
+
+                # Free accumulate when BOTH sides of this fresh Pair are done
+                if pair_is_fresh and pair:
+                    up_done = not (
+                        pair.up_order_id
+                        and pair.up_order_id in ws.pending_orders
+                        and ws.pending_orders[pair.up_order_id].cancelled_at == 0
+                    )
+                    down_done = not (
+                        pair.down_order_id
+                        and pair.down_order_id in ws.pending_orders
+                        and ws.pending_orders[pair.down_order_id].cancelled_at == 0
+                    )
+                    if up_done and down_done:
+                        ws.accumulate = max(0, ws.accumulate - pair.qty)
 
     # ── Order execution ──
 

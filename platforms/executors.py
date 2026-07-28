@@ -48,6 +48,7 @@ class OrderExecutor:
         up_token_id: str, down_token_id: str,
         up_price: float, up_amount: int,
         down_price: float, down_amount: int,
+        pair_id: str = "",
     ) -> tuple[bool, bool]:
         """Place paired Up+Down orders — sign both, submit together.
 
@@ -71,68 +72,30 @@ class OrderExecutor:
         """Remove soft-deleted orders past grace period. No-op in base."""
         pass
 
-    def _create_lot_and_pair(self, ws: WindowState, po: PendingOrder,
-                              fill_size: int, fill_price: float,
-                              pair_id: str = ""):
-        """Create a Lot for this fill (pairing done by strategy.free_pair)."""
+    def _create_lot(self, ws: WindowState, po: PendingOrder,
+                      fill_size: int, fill_price: float):
+        """Create a pure cost-record Lot for this fill."""
         lot_id = f"lot_{ws.window_num}_{po.side}_{len(ws.lots)}"
         lot = Lot(
             lot_id=lot_id, side=po.side,
             amount=fill_size, price=fill_price,
-            paired_qty=0, pair_id=pair_id,
             created_at=time.time(),
         )
         ws.lots.append(lot)
         logger.info(
-            "  [fill] %s lot=%s (%d @ %.4f)  pair=%s  "
-            "inv=(U=%d/D=%d) unpaired: Up=%d Down=%d",
+            "  [fill] %s lot=%s (%d @ %.4f)  inv=(U=%d/D=%d)",
             po.side, lot_id, fill_size, fill_price,
-            pair_id or "none",
             ws.inventory["Up"], ws.inventory["Down"],
-            sum(l.unpaired_qty for l in ws.lots if l.side == "Up"),
-            sum(l.unpaired_qty for l in ws.lots if l.side == "Down"),
         )
 
-    def _find_pair_for_order(self, ws: WindowState, order_id: str) -> Optional[Pair]:
-        """Find the Pair that contains this order ID, if any."""
+    def _find_pair_for_order(self, ws: WindowState, po: PendingOrder) -> Optional[Pair]:
+        """Find the Pair by PendingOrder.pair_id, if any."""
+        if not po.pair_id:
+            return None
         for pair in ws.pairs:
-            if order_id in (pair.up_order_id, pair.down_order_id):
+            if pair.pair_id == po.pair_id:
                 return pair
         return None
-
-    def _pair_lots_in_same_pair(self, ws: WindowState, pair_id: str):
-        """Directly pair lots belonging to the same Pair, bypassing free_pair.
-
-        When a re-pair or new-pair order fills, both sides' lots share the
-        same pair_id.  Pair them immediately so free_pair doesn't accidentally
-        match them with unrelated lots.
-        """
-        up_lots = [l for l in ws.lots
-                   if l.side == "Up" and l.pair_id == pair_id and l.unpaired_qty > 0]
-        down_lots = [l for l in ws.lots
-                     if l.side == "Down" and l.pair_id == pair_id and l.unpaired_qty > 0]
-        if not up_lots or not down_lots:
-            return
-
-        # Pair cheapest first within the same pair
-        up_lots.sort(key=lambda l: l.price)
-        down_lots.sort(key=lambda l: l.price)
-        paired = 0
-        for ul in up_lots:
-            for dl in down_lots:
-                if ul.unpaired_qty <= 0 or dl.unpaired_qty <= 0:
-                    continue
-                pair_qty = min(ul.unpaired_qty, dl.unpaired_qty)
-                ul.paired_qty += pair_qty
-                dl.paired_qty += pair_qty
-                paired += pair_qty
-
-        if paired:
-            logger.info(
-                "  [pair_lots] pair=%s %d contracts paired within same pair",
-                pair_id, paired,
-            )
-
 
 class LiveExecutor(OrderExecutor):
     """Live trading — SDK place_limit_order + cancel_order."""
@@ -173,6 +136,7 @@ class LiveExecutor(OrderExecutor):
                 side=outcome, buy_sell="BUY",
                 price=price, amount=amount,
                 placed_at=time.time(),
+                pair_id=pair_id,
             )
             await self.engine._emit("order_placed", OrderPlaced(
                 window_num=ws.window_num,
@@ -226,12 +190,14 @@ class LiveExecutor(OrderExecutor):
         up_token_id: str, down_token_id: str,
         up_price: float, up_amount: int,
         down_price: float, down_amount: int,
+        pair_id: str = "",
     ) -> tuple[bool, bool]:
         """Place paired Up+Down orders — sign both, submit together.
 
         1. Sign both orders in parallel (EIP-712)
         2. Submit both via post_orders (single HTTP request)
         3. Process each result: register pending orders, emit events
+        4. If pair_id given, link order IDs to the Pair object
         """
         ws = self.engine._windows.get(slug)
         if ws is None:
@@ -302,6 +268,7 @@ class LiveExecutor(OrderExecutor):
                 side=side, buy_sell="BUY",
                 price=price, amount=amount,
                 placed_at=time.time(),
+                pair_id=pair_id,
             )
             await self.engine._emit("order_placed", OrderPlaced(
                 window_num=ws.window_num,
@@ -309,6 +276,16 @@ class LiveExecutor(OrderExecutor):
                 price=price, amount=amount,
                 order_id=oid,
             ))
+
+            # Link order_id to Pair if this is a pair order
+            if pair_id:
+                for pair in ws.pairs:
+                    if pair.pair_id == pair_id:
+                        if side == "Up":
+                            pair.up_order_id = oid
+                        else:
+                            pair.down_order_id = oid
+                        break
 
             # Check orphan fills (fill arrived before we registered the order)
             orphan = self._orphan_fills.pop(oid, None)
@@ -346,8 +323,9 @@ class LiveExecutor(OrderExecutor):
         update inventory/cost.  flush_cancelled() removes them after the
         grace period.
 
-        Also cleans up the Pair object: clears the cancelled order_id so
-        Phase A re-pair won't reference a dead order.
+        Also cleans up the Pair object: clears the cancelled order_id.
+        Dissolves the Pair if the cancelled order never filled and the Pair
+        only has pre-filled inventory (no real fills from the other side).
         """
         ok = await self.engine.sdk.cancel_order(order_id)
         if ok:
@@ -358,55 +336,27 @@ class LiveExecutor(OrderExecutor):
                 po.cancelled_at = time.time()
 
                 # Clear the cancelled order from its Pair
-                pair = self._find_pair_for_order(ws, order_id)
+                pair = self._find_pair_for_order(ws, po)
                 if pair:
                     if pair.up_order_id == order_id:
                         pair.up_order_id = ""
                     elif pair.down_order_id == order_id:
                         pair.down_order_id = ""
 
-                    # If the cancelled order never filled and the pair has
-                    # no real fills (just Phase B pre-fill), dissolve it
-                    # and reverse the pre-fill on heavy-side lots so they
-                    # re-enter the free-pairing pool.
-                    #
-                    # Phase B pre-fills exactly one side to qty.  Real fills
-                    # from _process_fill increment beyond qty or fill the
-                    # other side.  Checking for the exact pre-fill pattern
-                    # avoids dissolving a pair that has real fills from a
-                    # previous order (e.g. re-pair order cancelled after the
-                    # original order partially filled).
+                    # Dissolve if the cancelled order never filled and the
+                    # Pair only has pre-fill on one side (step2 prefill pattern).
                     prefill_only = (
                         (pair.up_filled == pair.qty and pair.down_filled == 0)
                         or (pair.down_filled == pair.qty and pair.up_filled == 0)
                     )
                     if po.filled == 0 and prefill_only:
-                        prefill_side = "Up" if pair.up_filled > 0 else "Down"
-                        prefill_amount = pair.up_filled if prefill_side == "Up" else pair.down_filled
-                        reversed_qty = 0
-                        remaining = prefill_amount
-                        for lot in ws.lots:
-                            if lot.pair_id == pair.pair_id and lot.side == prefill_side and remaining > 0:
-                                revert = min(lot.paired_qty, remaining)
-                                lot.paired_qty -= revert
-                                lot.pair_id = ""
-                                reversed_qty += revert
-                                remaining -= revert
-                        # Clear pair_id from any remaining lots on the other
-                        # side (shouldn't exist when prefill_only is true,
-                        # but belt-and-suspenders).
-                        for lot in ws.lots:
-                            if lot.pair_id == pair.pair_id:
-                                lot.pair_id = ""
+                        # Prefilled inventory reverts to unpaired — no lot surgery needed
                         pair.up_filled = 0
                         pair.down_filled = 0
                         ws.pairs.remove(pair)
                         logger.info(
-                            "  [cancel] Pair %s dissolved (order %s had no fills)  "
-                            "reversed %d paired_qty on %s side  unpaired: Up=%d Down=%d",
-                            pair.pair_id, order_id[:12], reversed_qty, prefill_side,
-                            sum(l.unpaired_qty for l in ws.lots if l.side == "Up"),
-                            sum(l.unpaired_qty for l in ws.lots if l.side == "Down"),
+                            "  [cancel] Pair %s dissolved (order %s had no fills)",
+                            pair.pair_id, order_id[:12],
                         )
                     elif pair.up_filled == 0 and pair.down_filled == 0:
                         ws.pairs.remove(pair)
@@ -453,7 +403,7 @@ class LiveExecutor(OrderExecutor):
 
     def _process_fill(self, ws: WindowState, po: PendingOrder,
                       fill_size: int, fill_price: float):
-        """Apply a fill to a pending order and update pair tracking."""
+        """Apply a fill to a pending order and update Pair tracking."""
         actual = min(fill_size, po.remaining)
         if actual <= 0:
             return
@@ -469,22 +419,15 @@ class LiveExecutor(OrderExecutor):
         ws.total_spent += actual * fill_price
         ws.trades += 1
 
-        # Find which pair this order belongs to, if any
-        pair_id = ""
-        pair = self._find_pair_for_order(ws, po.order_id)
+        # Find which pair this order belongs to, if any, and update its fills
+        pair = self._find_pair_for_order(ws, po)
         if pair:
             if po.order_id == pair.up_order_id:
                 pair.up_filled += actual
             else:
                 pair.down_filled += actual
-            pair_id = pair.pair_id
 
-        self._create_lot_and_pair(ws, po, actual, fill_price, pair_id=pair_id)
-
-        # If this fill completes a pair, directly pair lots within the same pair
-        # to avoid free_pair matching them with unrelated lots.
-        if pair and pair_id:
-            self._pair_lots_in_same_pair(ws, pair_id)
+        self._create_lot(ws, po, actual, fill_price)
 
         remaining = po.amount - po.filled
         logger.info(

@@ -58,7 +58,8 @@ python -m poly_trader check                               # verify credentials
 | `POLY_AGGRESSIVENESS` | 0.3 | Maker price = bid + spread × aggressiveness (0-1) |
 | `POLY_MIN_PRICE_GAP` | 0.02 | Min price gap to place another order on same side |
 | `POLY_CANCEL_MIN_AGE` | 120.0 | Min seconds before pending order can be cancelled |
-| `POLY_CANCEL_REPLACE_THRESHOLD` | 10.0 | Fractional price deviation to trigger cancel-replace |
+| `POLY_CANCEL_REPLACE_THRESHOLD` | 0.10 | Absolute price deviation for early cancel of two-leg Pairs |
+| `POLY_CANCEL_MAX_AGE` | 600.0 | Hard force-cancel safety net (seconds) |
 | `POLY_MIN_REMAINING_TIME` | 180.0 | Stop new orders when < this many seconds left in window |
 | `POLY_MIN_ORDER_SIZE` | 5 | Minimum order size in contracts |
 | `POLY_MAX_IMBALANCE` | 10 | Stop adding to heavy side when filled+pending difference exceeds this |
