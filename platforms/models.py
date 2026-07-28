@@ -109,22 +109,12 @@ class OrderBookSnapshot:
 
 @dataclass
 class Lot:
-    """A single fill record — the fundamental unit of cost tracking and pairing."""
+    """A single fill record — cost tracking only (no pairing fields)."""
     lot_id: str
     side: str         # "Up" / "Down"
     amount: int       # original fill size
     price: float      # fill price
-    paired_qty: int = 0
-    pair_id: str = ""  # links to Pair.pair_id when paired
     created_at: float = 0.0
-
-    @property
-    def unpaired_qty(self) -> int:
-        return self.amount - self.paired_qty
-
-    @property
-    def is_fully_paired(self) -> bool:
-        return self.paired_qty >= self.amount
 
 
 @dataclass
@@ -181,6 +171,7 @@ class PendingOrder:
     filled: int = 0
     placed_at: float = 0.0
     cancelled_at: float = 0.0  # soft-delete timestamp; > 0 means cancel requested
+    pair_id: str = ""  # links to Pair.pair_id
 
     @property
     def remaining(self) -> int:
@@ -213,8 +204,27 @@ class WindowState:
     total_spent: float = 0.0
     trades: int = 0
     pending_orders: dict[str, PendingOrder] = field(default_factory=dict)
-    lots: list = field(default_factory=list)  # list[Lot] — per-fill records for pairing
+    lots: list = field(default_factory=list)  # list[Lot] — cost records only
     pairs: list = field(default_factory=list)  # list[Pair] — active pairs for this window
+    accumulate: int = 0  # step3 cumulative placed qty (shared room for Up+Down)
+
+    @property
+    def paired_up(self) -> int:
+        """Total Up contracts committed across all Pairs."""
+        return sum(p.up_filled for p in self.pairs)
+
+    @property
+    def paired_down(self) -> int:
+        """Total Down contracts committed across all Pairs."""
+        return sum(p.down_filled for p in self.pairs)
+
+    @property
+    def unpaired_up(self) -> int:
+        return self.inventory["Up"] - self.paired_up
+
+    @property
+    def unpaired_down(self) -> int:
+        return self.inventory["Down"] - self.paired_down
 
     @property
     def avg_cost_up(self) -> float:
@@ -240,15 +250,15 @@ class WindowState:
 
     @property
     def guaranteed_pnl(self) -> float:
-        """PnL from completed pairs only: paired contracts' settlement value minus their cost.
+        """PnL from completed pairs only, estimated from avg costs.
 
-        Uses lot-level paired_qty tracking so unpaired contracts' costs are
-        excluded — total_spent includes the full inventory (both paired and
-        unpaired), which would unfairly make guaranteed_pnl always negative
-        whenever there is any imbalance.
+        Assumes the cheapest contracts pair first.  Uses avg cost per side
+        as an approximation when lot-level granularity isn't available.
         """
-        paired_cost = sum(l.price * l.paired_qty for l in self.lots)
-        return self.guaranteed_pairs - paired_cost
+        n = self.guaranteed_pairs
+        if n == 0:
+            return 0.0
+        return n - n * (self.avg_cost_up + self.avg_cost_down)
 
     @property
     def total_contracts(self) -> int:

@@ -2,9 +2,9 @@
 Pair-first maker strategy for V3.
 
 Each tick:
-  1. Free-pair existing unpaired lots (cost <= pair_cost_max, no orders)
-  2. If still unbalanced, place a new pair order (cost <= pair_cost_max)
-  3. Normal independent logic (only if step 2 didn't place)
+  1. Fuse single-leg Pairs into two-leg Pairs
+  2. If inventory imbalance, place a pair order to re-balance
+  3. Place new Up+Down pair (always 0 or 2 decisions, engine creates Pair)
 """
 
 from __future__ import annotations
@@ -56,26 +56,14 @@ class MakerStrategy:
         exposure_down = inv_down + pending_down
 
         # ════════════════════════════════════════════
-        # Step 1: Free pairing — match existing lots
+        # Step 1: Fuse single-leg Pairs into two-leg Pairs
         # ════════════════════════════════════════════
-        self._free_pair(ws)
-
-        # ── Count remaining unpaired ──
-        unpaired_up_lots = [l for l in ws.lots if l.side == "Up" and l.unpaired_qty > 0]
-        unpaired_down_lots = [l for l in ws.lots if l.side == "Down" and l.unpaired_qty > 0]
-        unpaired_up = sum(l.unpaired_qty for l in unpaired_up_lots)
-        unpaired_down = sum(l.unpaired_qty for l in unpaired_down_lots)
+        self._fuse_pairs(ws)
 
         # ════════════════════════════════════════════
-        # Step 2: New pair order to cover imbalance
-        #         (unpaired lots only — existing pairs left alone)
+        # Step 2: Pair order to cover inventory imbalance
         # ════════════════════════════════════════════
-        placed_pair = self._step2_pair_order(
-            ws, up_price, down_price,
-            unpaired_up, unpaired_down,
-            unpaired_up_lots, unpaired_down_lots,
-            exposure_up, exposure_down,
-        )
+        placed_pair = self._step2_pair_order(ws, up_price, down_price)
         if placed_pair:
             return placed_pair
 
@@ -88,157 +76,142 @@ class MakerStrategy:
         )
 
     # ──────────────────────────────────────────────
-    # Step 1: Free pairing
+    # Step 1: Fuse single-leg Pairs
     # ──────────────────────────────────────────────
 
-    def _free_pair(self, ws: WindowState):
-        """Match unpaired Up and Down lots where cost <= pair_cost_max.
+    def _fuse_pairs(self, ws: WindowState):
+        """Fuse single-leg Pairs into two-leg Pairs — maximize matching.
 
-        Strategy: sort Up ascending (cheapest first), Down descending (most
-        expensive first).  Each cheap Up pairs with the most expensive Down
-        that still fits the budget, preserving cheap Down lots for expensive
-        Up lots that can't pair otherwise.
+        All single-leg Pairs participate regardless of fill status:
+          - Fresh (0 fill, 1 pending)
+          - Partial fill (e.g. up_filled=3, down_filled=0)
+          - Fully filled one side (e.g. up_filled=5, down_filled=0)
 
-        This is a two-pointer maximum-bipartite-matching under a monotonic
-        cost constraint — pairing cheap+expensive maximizes total matched
-        contracts compared to cheap+cheap greedy.
+        Fusion condition: up_price + down_price <= pair_cost_max (1.0)
+        Must be one Up-leg + one Down-leg.  Maximizes matches by pairing
+        expensive Up-legs with cheap Down-legs (greedy).
+
+        Transfers fills, pending order, and price from dissolved Pair
+        to survivor.  Releases dissolved Pair's qty from accumulate.
         """
         cfg = self.cfg
-        up_lots = [l for l in ws.lots if l.side == "Up" and l.unpaired_qty > 0]
-        down_lots = [l for l in ws.lots if l.side == "Down" and l.unpaired_qty > 0]
 
-        if not up_lots or not down_lots:
-            return
+        up_legs: list[Pair] = []    # has active Up, missing Down
+        down_legs: list[Pair] = []  # has active Down, missing Up
 
-        up_lots.sort(key=lambda l: l.price)               # cheapest Up first
-        down_lots.sort(key=lambda l: l.price, reverse=True)  # most expensive Down first
-
-        paired = 0
-        for ul in up_lots:
-            if ul.is_fully_paired:
-                continue
-            for dl in down_lots:
-                if dl.unpaired_qty <= 0:
-                    continue
-                if ul.unpaired_qty <= 0:
-                    break
-
-                # Cost check: too expensive → cheaper Down next (descending), try next
-                if ul.price + dl.price > cfg.pair_cost_max:
-                    continue
-
-                # Found a match
-                pair_qty = min(ul.unpaired_qty, dl.unpaired_qty)
-                ul.paired_qty += pair_qty
-                dl.paired_qty += pair_qty
-                paired += pair_qty
-
-        if paired:
-            logger.info(
-                "  [free_pair] %d contracts paired  unpaired remaining: Up=%d Down=%d",
-                paired,
-                sum(l.unpaired_qty for l in ws.lots if l.side == "Up"),
-                sum(l.unpaired_qty for l in ws.lots if l.side == "Down"),
+        for pair in list(ws.pairs):
+            has_up = (
+                pair.up_filled > 0
+                or (pair.up_order_id
+                    and pair.up_order_id in ws.pending_orders
+                    and ws.pending_orders[pair.up_order_id].cancelled_at == 0)
+            )
+            has_down = (
+                pair.down_filled > 0
+                or (pair.down_order_id
+                    and pair.down_order_id in ws.pending_orders
+                    and ws.pending_orders[pair.down_order_id].cancelled_at == 0)
             )
 
+            if has_up and not has_down:
+                up_legs.append(pair)
+            elif has_down and not has_up:
+                down_legs.append(pair)
+            # else: both legs or neither → skip
+
+        if not up_legs or not down_legs:
+            return
+
+        # Maximize matches: pair expensive Up with cheap Down
+        up_legs.sort(key=lambda p: p.up_price, reverse=True)  # most expensive first
+        down_legs.sort(key=lambda p: p.down_price)  # cheapest first
+
+        used_down: set[int] = set()
+        matched = 0
+
+        for up_pair in up_legs:
+            for di, down_pair in enumerate(down_legs):
+                if di in used_down:
+                    continue
+                if up_pair.up_price + down_pair.down_price > cfg.pair_cost_max:
+                    continue
+
+                # ── Match: dissolve down_pair into up_pair ──
+                down_oid = down_pair.down_order_id
+                up_pair.down_order_id = down_oid
+                up_pair.down_filled += down_pair.down_filled
+                up_pair.down_price = down_pair.down_price
+
+                # Relink pending order to survivor
+                if down_oid and down_oid in ws.pending_orders:
+                    ws.pending_orders[down_oid].pair_id = up_pair.pair_id
+
+                # Release dissolved Pair's accumulate
+                ws.accumulate = max(0, ws.accumulate - down_pair.qty)
+
+                ws.pairs.remove(down_pair)
+                used_down.add(di)
+                matched += 1
+
+                logger.info(
+                    "  [fuse] %s + %s → %s  cost=%.4f  "
+                    "fills=(U=%d/D=%d) accumulate=%d",
+                    up_pair.pair_id, down_pair.pair_id, up_pair.pair_id,
+                    up_pair.up_price + down_pair.down_price,
+                    up_pair.up_filled, up_pair.down_filled,
+                    ws.accumulate,
+                )
+                break  # up_pair matched, try next
+
+        if matched:
+            logger.info("  [fuse] Matched %d pairs  accumulate=%d", matched, ws.accumulate)
+
     # ──────────────────────────────────────────────
-    # Step 2: Re-pair + new pair order
+    # Step 2: Pair order to re-balance inventory
     # ──────────────────────────────────────────────
 
     def _step2_pair_order(
         self, ws: WindowState,
         up_price: float, down_price: float,
-        unpaired_up: int, unpaired_down: int,
-        unpaired_up_lots: list, unpaired_down_lots: list,
-        exposure_up: int, exposure_down: int,
     ) -> list[Decision] | None:
-        """Place a new pair order for completely unpaired lots only.
+        """Place a pair order to re-balance inventory.
 
-        Scans unpaired heavy lots individually and finds the first affordable
-        one to pair against a new light-side order.  Per-lot cost check (not
-        average) avoids skipping good lots just because another expensive lot
-        drags the average up.
-
-        Does NOT handle re-pairing — pairs with partial fills are left for
-        future ticks (free_pair will re-match them when both sides fill).
+        Uses inventory-level imbalance (inv_up - paired_up vs inv_down - paired_down)
+        instead of lot-level tracking.  Cost check uses heavy side avg cost.
 
         Returns a decision list or None to fall through to step 3.
         """
         cfg = self.cfg
 
-        # ── New pair order for remaining unpaired lots ──
+        unpaired_up = ws.unpaired_up
+        unpaired_down = ws.unpaired_down
+
         if unpaired_up == 0 and unpaired_down == 0:
             return None
 
-        # Determine which side to buy, then find first affordable heavy lot
+        # Determine which side to buy
         if unpaired_up > unpaired_down:
             pair_side = "Down"
-            heavy_lots = [l for l in unpaired_up_lots if l.unpaired_qty > 0]
-            heavy_label = "Up"
             price = down_price
+            heavy_avg = ws.avg_cost_up
+            prefill_side = "Up"
         elif unpaired_down > unpaired_up:
             pair_side = "Up"
-            heavy_lots = [l for l in unpaired_down_lots if l.unpaired_qty > 0]
-            heavy_label = "Down"
             price = up_price
+            heavy_avg = ws.avg_cost_down
+            prefill_side = "Down"
         else:
-            # Equal unpaired qty — find the lot with higher price on either side
-            candidates: list[tuple] = []
-            for l in unpaired_up_lots:
-                if l.unpaired_qty > 0:
-                    candidates.append((l, "Down", down_price))  # if buying Down
-            for l in unpaired_down_lots:
-                if l.unpaired_qty > 0:
-                    candidates.append((l, "Up", up_price))      # if buying Up
-            if not candidates:
-                return None
-            # Sort by heavy price descending: try the most expensive heavy lot first
-            candidates.sort(key=lambda x: x[0].price, reverse=True)
-            for heavy_lot, p_side, p_price in candidates:
-                if heavy_lot.price + p_price <= cfg.pair_cost_max:
-                    pair_side = p_side
-                    heavy_lot_selected = heavy_lot
-                    heavy_label = "Down" if p_side == "Up" else "Up"
-                    price = p_price
-                    break
-            else:
-                logger.info(
-                    "  [pair_order] No affordable pair at current prices → skip",
-                )
-                return None
-
-            exposure = exposure_up if pair_side == "Up" else exposure_down
-            room = cfg.max_per_side - exposure
-            heavy_lots = [heavy_lot_selected]
-
-        # Find first affordable heavy lot (per-lot cost check)
-        heavy_lot = None
-        for lot in heavy_lots:
-            if lot.unpaired_qty <= 0:
-                continue
-            if lot.price + price > cfg.pair_cost_max:
-                continue
-            heavy_lot = lot
-            break
-
-        if heavy_lot is None:
-            logger.info(
-                "  [pair_order] %s cost check: all heavy lots too expensive "
-                "(price=%.4f, first heavy=%.4f) → skip",
-                pair_side, price,
-                heavy_lots[0].price if heavy_lots else 0,
-            )
+            # Balanced — nothing to do
             return None
 
         if price <= 0:
             return None
-        exposure = exposure_up if pair_side == "Up" else exposure_down
-        room = cfg.max_per_side - exposure
 
-        if room < cfg.min_order_size:
+        # Cost check: heavy side avg + current price <= pair_cost_max
+        if heavy_avg + price > cfg.pair_cost_max:
             logger.info(
-                "  [pair_order] %s at limit %d/%d → skip",
-                pair_side, exposure, cfg.max_per_side,
+                "  [pair_order] Cost too high: %s avg=%.4f + %s price=%.4f > %.2f → skip",
+                prefill_side, heavy_avg, pair_side, price, cfg.pair_cost_max,
             )
             return None
 
@@ -255,40 +228,31 @@ class MakerStrategy:
             )
             return None
 
-        # Place order
-        qty = min(cfg.min_order_size, room)
-        if qty >= cfg.min_order_size:
-            logger.info(
-                "  [pair_order] %s %d @ %.4f (heavy=%s lot=%.4f need=%d/%d)",
-                pair_side, qty, price, heavy_label,
-                heavy_lot.price, heavy_lot.unpaired_qty, heavy_lot.amount,
-            )
-
-            # Create Pair object for fill tracking
-            pair = Pair(
-                pair_id=f"pair_{ws.window_num}_{len(ws.pairs)}",
-                up_price=up_price if pair_side == "Up" else heavy_lot.price,
-                down_price=down_price if pair_side == "Down" else heavy_lot.price,
-                qty=cfg.min_order_size,
-            )
-            ws.pairs.append(pair)
-
-            # Pre-fill the heavy side — this specific lot
-            if pair_side == "Down":
-                pair.up_filled = qty
-            else:
-                pair.down_filled = qty
-            match = min(heavy_lot.unpaired_qty, qty)
-            heavy_lot.paired_qty += match
-            heavy_lot.pair_id = pair.pair_id
-
-            return [Decision(side=pair_side, amount=qty, price=price, pair_id=pair.pair_id)]
+        # Place order: prefill heavy side with unpaired excess
+        qty = cfg.min_order_size
+        excess = abs(unpaired_up - unpaired_down)
+        prefill_qty = min(excess, qty)
 
         logger.info(
-            "  [pair_order] %s qty %d < min_order_size %d → skip",
-            pair_side, qty, cfg.min_order_size,
+            "  [pair_order] %s %d @ %.4f  (heavy=%s unpaired=%d avg=%.4f  prefill=%d)",
+            pair_side, qty, price, prefill_side,
+            excess, heavy_avg, prefill_qty,
         )
-        return None
+
+        # Create Pair, prefill heavy side from existing inventory
+        pair = Pair(
+            pair_id=f"pair_{ws.window_num}_{len(ws.pairs)}",
+            up_price=up_price if pair_side == "Up" else price,
+            down_price=down_price if pair_side == "Down" else price,
+            qty=qty,
+        )
+        if prefill_side == "Up":
+            pair.up_filled = prefill_qty
+        else:
+            pair.down_filled = prefill_qty
+        ws.pairs.append(pair)
+
+        return [Decision(side=pair_side, amount=qty, price=price, pair_id=pair.pair_id)]
 
     # ──────────────────────────────────────────────
     # Step 3: Normal logic — per-side independent orders
@@ -299,28 +263,29 @@ class MakerStrategy:
         up_price: float, down_price: float,
         exposure_up: int, exposure_down: int,
     ) -> list[Decision]:
-        """Per-side independent Up/Down orders — normal market making.
+        """Place a new Up+Down pair (always 0 or 2 decisions).
 
-        Only runs when step 2 did NOT place a pair order.
-        Unlike step 2 (pair order to fix imbalance), step 3 places Up and
-        Down independently, subject to per-side guards.
+        Step 3 is the only source of new positions.  Always places Up+Down
+        together as a unit.  The engine creates the Pair object when both
+        sides are successfully placed.
 
-        Guards:
-          - Room: both sides have space for min_order_size (preserve room for pairing)
-          - Atomic pre-check: either side price too close to pending → skip both
-          - Per-side: room check, imbalance guard (based on filled inventory)
-          - Pair cost cap (both sides only): up_price + down_price <= pair_cost_max
+        Room is shared via ws.accumulate (one pool for both sides).  Guards
+        block the entire tick (not per-side):
+
+          - Shared room: max_per_side - accumulate < min_order_size → skip
+          - Atomic pre-check: Up or Down price too close to pending → skip both
+          - Imbalance: exposure or filled inventory gap too large → skip both
+          - Pair cost cap: up_price + down_price > pair_cost_max → skip
         """
         decisions: list[Decision] = []
         cfg = self.cfg
 
-        # ── Room check: need space on both sides to preserve room for future pairing ──
-        room_up = cfg.max_per_side - exposure_up
-        room_down = cfg.max_per_side - exposure_down
-        if room_up < cfg.min_order_size or room_down < cfg.min_order_size:
+        # ── Shared room check: max_per_side - accumulate (both sides share one pool) ──
+        shared_room = cfg.max_per_side - ws.accumulate
+        if shared_room < cfg.min_order_size:
             logger.info(
-                "  [step3] Room insufficient: Up=%d/%d Down=%d/%d → skip",
-                exposure_up, cfg.max_per_side, exposure_down, cfg.max_per_side,
+                "  [step3] accumulate=%d >= %d → skip",
+                ws.accumulate, cfg.max_per_side,
             )
             return decisions
 
@@ -343,62 +308,38 @@ class MakerStrategy:
             )
             return decisions
 
+        # ── Imbalance guards: block the whole tick (not per-side) ──
+        exp_imbalance = abs(exposure_up - exposure_down)
+        if exp_imbalance >= cfg.max_imbalance:
+            logger.info(
+                "  [step3] Exp imbalance %d >= %d (U=%d D=%d) → skip",
+                exp_imbalance, cfg.max_imbalance,
+                exposure_up, exposure_down,
+            )
+            return decisions
+
         inv_up = ws.inventory["Up"]
         inv_down = ws.inventory["Down"]
+        inv_imbalance = abs(inv_up - inv_down)
+        if inv_imbalance >= cfg.max_imbalance:
+            logger.info(
+                "  [step3] Inv imbalance %d >= %d (inv U=%d D=%d  exp U=%d D=%d) → skip",
+                inv_imbalance, cfg.max_imbalance,
+                inv_up, inv_down, exposure_up, exposure_down,
+            )
+            return decisions
 
-        # ── Per-side independent decisions ──
-        for side, price, exposure in [
-            ("Up", up_price, exposure_up),
-            ("Down", down_price, exposure_down),
-        ]:
-            # Room check (per side)
-            room = cfg.max_per_side - exposure
-            if room < cfg.min_order_size:
-                continue
-
-            # Imbalance guard: two independent checks — either can block.
-            #
-            # 1. Total exposure imbalance (inv + pending):
-            #    if one side has way more total exposure, it's adding risk.
-            exp_imbalance = abs(exposure_up - exposure_down)
-            if exp_imbalance >= cfg.max_imbalance:
-                heavy_exp = "Up" if exposure_up > exposure_down else "Down"
-                if side == heavy_exp:
-                    logger.info(
-                        "  [step3] %s skip: exp imbalance %d >= %d (U=%d D=%d)",
-                        side, exp_imbalance, cfg.max_imbalance,
-                        exposure_up, exposure_down,
-                    )
-                    continue
-
-            # 2. Filled inventory imbalance:
-            #    pending may never fill — exposure gives false balance when
-            #    one side has heavy fills and the other heavy pending.
-            #    Example: inv_up=15, pending_down=15 → exposure balanced,
-            #    but real filled imbalance = 15.
-            inv_imbalance = abs(inv_up - inv_down)
-            if inv_imbalance >= cfg.max_imbalance:
-                heavy_inv = "Up" if inv_up > inv_down else "Down"
-                if side == heavy_inv:
-                    logger.info(
-                        "  [step3] %s skip: inv imbalance %d >= %d (inv U=%d D=%d  exp U=%d D=%d)",
-                        side, inv_imbalance, cfg.max_imbalance,
-                        inv_up, inv_down, exposure_up, exposure_down,
-                    )
-                    continue
-
-            qty = min(cfg.min_order_size, room)
-            decisions.append(Decision(side=side, amount=qty, price=price))
-
-        # ── Pair cost cap: only when both sides would be placed ──
-        if len(decisions) == 2 and up_price + down_price > cfg.pair_cost_max:
+        # ── Pair cost cap ──
+        if up_price + down_price > cfg.pair_cost_max:
             logger.info(
                 "  [step3] Pair cost %.4f > %.2f → skip (would lock loss)",
                 up_price + down_price, cfg.pair_cost_max,
             )
-            return []
+            return decisions
 
-        if decisions:
-            parts = [f"{d.side}={d.amount}@{d.price:.4f}" for d in decisions]
-            logger.info("  [step3] %s", "  ".join(parts))
+        # ── Both sides pass all guards → place 5+5 ──
+        qty = cfg.min_order_size
+        decisions.append(Decision(side="Up", amount=qty, price=up_price))
+        decisions.append(Decision(side="Down", amount=qty, price=down_price))
+        logger.info("  [step3] Up=%d@%.4f  Down=%d@%.4f", qty, up_price, qty, down_price)
         return decisions
