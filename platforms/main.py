@@ -48,7 +48,7 @@ def parse_market_spec(pattern: str) -> MarketSpec:
 
 async def async_main(args: argparse.Namespace):
     cfg = Config()
-
+    args.mode ="run"
     if args.mode == "run":
         if not cfg.private_key:
             print("ERROR: Live mode requires POLY_PRIVATE_KEY environment variable")

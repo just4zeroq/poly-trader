@@ -4,7 +4,7 @@
 
 Pair is a first-class entity. Each tick flow: (1) free-pair existing unpaired lots, (2) place new pair orders to cover remaining imbalance, (3) normal independent market making.
 
-**1 pair = 5 contracts Up + 5 contracts Down** — matches current `per_tick=5`.
+**1 pair = 5 contracts Up + 5 contracts Down** — matches `MIN_ORDER_SIZE=5`.
 
 ## Data Model
 
@@ -47,10 +47,11 @@ Add to `WindowState`:
 |----------|-------|-------|
 | `POLY_PAIR_COST_MAX` | 1.0 | Pair cost cap (break-even) |
 | `POLY_MAX_PER_SIDE` | 20 | Unchanged — max exposure per side |
-| `POLY_MIN_PRICE_GAP` | 0.02 | Unchanged — applies to new pairs and normal logic |
-| `POLY_MIN_ORDER_SIZE` | 5 | Unchanged |
+| `POLY_MIN_PRICE_GAP` | 0.02 | Unchanged — atomic pre-check + step 2 min_gap |
+| `POLY_MIN_ORDER_SIZE` | 5 | Unchanged — default order qty per side |
+| `POLY_MAX_IMBALANCE` | 10 | Both exp + inv imbalance guards in step 3 |
 
-Removed: `POLY_PER_TICK` — replaced by 1 pair per tick (5 each side).
+Removed: `POLY_PER_TICK` — replaced by `MIN_ORDER_SIZE` (default 5).
 Removed: `POLY_PAIR_FALLTHROUGH_THRESHOLD` — normal logic always runs after pairing.
 Removed: `POLY_REPAIR_COST_MAX` — unified under `POLY_PAIR_COST_MAX`.
 
@@ -75,26 +76,30 @@ decide():
    └─ Guard: min_gap, room
 
 3. Normal logic (only if step 2 didn't place a new pair)
-   └─ Room check first: 待配对数 × 5 <= max_per_side - exposure
-   │    不通 → skip tick (preserve room for future pairing)
+   └─ Room check: both sides need min_order_size room (preserve capacity for pairing)
+   │    不通 → skip tick
    │
    └─ Atomic pre-check: Up or Down price too close to pending → skip both
    │
    └─ Per-side independent Up/Down orders:
         ├─ room check
-        ├─ imbalance guard (filled, filled+pending)
-        ├─ min_gap
+        ├─ exp imbalance guard — total exposure too large → block heavy side
+        ├─ inv imbalance guard — filled inventory too heavy → block heavy side
         ├─ min_order_size
         └─ place order
+   │
+   └─ Pair cost cap: both sides placed AND up+down > pair_cost_max → cancel both
 
 
 Guard matrix:
                  Step 2 pair   Step 3 normal
-  min_gap          ✓            ✓
   room             ✓            ✓
-  pair cost cap   1.0          N/A
-  imbalance       N/A           ✓
   atomic pre-check N/A          ✓
+  exp imbalance   N/A           ✓
+  inv imbalance   N/A           ✓
+  pair cost cap   1.0          1.0 (both sides only)
+  min_gap          ✓            covered by atomic pre-check
+  min_order_size   ✓            ✓
 ```
 
 ## Cancel-Replace
@@ -102,7 +107,7 @@ Guard matrix:
 | Variable | Value | Notes |
 |----------|-------|-------|
 | `POLY_CANCEL_REPLACE_THRESHOLD` | 10.0 | Price deviation % to trigger cancel (unchanged) |
-| `POLY_CANCEL_MIN_AGE` | 120s | Min age before cancel (unchanged) |
+| `POLY_CANCEL_MIN_AGE` | 180s | Min age before cancel (unchanged) |
 
 ### Rules
 
@@ -114,7 +119,7 @@ Guard matrix:
 - **Free pairing is free**: No orders placed, just bookkeeping. Matches lots whose prices sum <= 1.0.
 - **Normal logic always runs**: Its own guards (imbalance, min_gap, atomic pre-check) prevent it from making bad situations worse.
 - **New pair uses current market price**: Not the locked price from the original lot.
-- **Partial fill (TBD)**: Pair qty=5, Up filled 3, Down filled 0. Up pending 2. Wait for fills. If pending cancelled → need to handle later.
+- **Partial fill**: Orders with `filled > 0` are excluded from cancel-replace (Rule 2). Let them ride until fill or window end.
 
 ## Pending: Kill-Switch
 

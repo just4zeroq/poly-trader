@@ -612,8 +612,8 @@ class TradingEngine:
         ))
 
         # Cancel lingering orders from a previous instance (scoped to this market)
-        if self.sdk.is_secure and market.condition_id:
-            await self.sdk.cancel_all_open_orders(market=market.condition_id)
+        # if self.sdk.is_secure and market.condition_id:
+        #     await self.sdk.cancel_all_open_orders(market=market.condition_id)
 
         # ── Restore current positions (engine restart mid-window) ──
         state = await self.sdk.load_current_state(market)
@@ -640,13 +640,16 @@ class TradingEngine:
         while self._running:
             now = time.time()
             remaining = window_end - now
+            #最后5秒结束循环
             if remaining <= self.cfg.settle_buffer:
                 break
-
+            # PriceCache 内部有个 asyncio.Event，WS 线程收到新 bid/ask 时 event.set() 唤醒它。没有新价格就等 timeout（5s）自动继续。
+            #效果：tick 循环不会空转，有新价格立刻处理，没价格 5s 一轮保活。
             await self.prices.wait_update(timeout=5.0)
 
             # Throttle: minimum interval between ticks (default 1s)
             now = time.time()
+            # 防止处理过快
             if now - self._last_tick_time < self.cfg.min_tick_interval:
                 continue
 
@@ -846,6 +849,7 @@ class TradingEngine:
             return None, None
 
         # Skip if either side is already settled (best_bid > threshold)
+        # self.cfg.max_extreme_price  超过这个就不下单了
         if up_snap.best_bid > self.cfg.max_extreme_price:
             logger.info("[%s] Up best_bid %.4f > %.2f → market settled, skip",
                         slug, up_snap.best_bid, self.cfg.max_extreme_price)
