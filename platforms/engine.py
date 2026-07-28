@@ -684,7 +684,9 @@ class TradingEngine:
                 continue
 
             # Cancel-replace: reprice stale pending orders
+            # 移除删除取消订单
             await self.executor.flush_cancelled()
+            # 取消过期订单
             await self._cancel_stale_pending(ws_state, up_price, down_price)
 
             decisions = self.strategy.decide(
