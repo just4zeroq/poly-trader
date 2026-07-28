@@ -67,8 +67,8 @@ class MakerStrategy:
         unpaired_down = sum(l.unpaired_qty for l in unpaired_down_lots)
 
         # ════════════════════════════════════════════
-        # Step 2: Re-pair existing incomplete pairs,
-        #         then new pair order to cover imbalance
+        # Step 2: New pair order to cover imbalance
+        #         (unpaired lots only — existing pairs left alone)
         # ════════════════════════════════════════════
         placed_pair = self._step2_pair_order(
             ws, up_price, down_price,
@@ -152,90 +152,21 @@ class MakerStrategy:
         unpaired_up_lots: list, unpaired_down_lots: list,
         exposure_up: int, exposure_down: int,
     ) -> list[Decision] | None:
-        """First try re-pairing existing pairs, then new pair for imbalance.
+        """Place a new pair order for completely unpaired lots only.
 
-        Phase A — Re-pair: for each incomplete pair, find the lagging side
-        (one side has fewer fills) and place one order to catch up.
-        Handles both "one side full" and "both sides partial" cases.
+        Scans unpaired heavy lots individually and finds the first affordable
+        one to pair against a new light-side order.  Per-lot cost check (not
+        average) avoids skipping good lots just because another expensive lot
+        drags the average up.
 
-        Phase B — New pair: scan unpaired heavy lots individually and find
-        the first affordable one to pair against a new light-side order.
-        Per-lot cost check (not average) avoids skipping good lots just
-        because another expensive lot drags the average up.
+        Does NOT handle re-pairing — pairs with partial fills are left for
+        future ticks (free_pair will re-match them when both sides fill).
 
         Returns a decision list or None to fall through to step 3.
         """
         cfg = self.cfg
 
-        # ── Phase A: Re-pair existing incomplete pairs ──
-        for pair in ws.pairs:
-            if pair.is_complete:
-                continue
-
-            # Determine which side is lagging
-            if pair.up_filled < pair.down_filled:
-                pending_side = "Up"
-                filled_price = pair.down_price
-                remaining = pair.down_filled - pair.up_filled
-                price = up_price
-            elif pair.down_filled < pair.up_filled:
-                pending_side = "Down"
-                filled_price = pair.up_price
-                remaining = pair.up_filled - pair.down_filled
-                price = down_price
-            else:
-                continue  # balanced, nothing to re-pair
-
-            if price <= 0:
-                continue
-
-            # Cost check: filled side's price + current price <= pair_cost_max
-            if filled_price + price > cfg.pair_cost_max:
-                logger.info(
-                    "  [re-pair] %s cost %.4f + %.4f = %.4f > %.2f → skip",
-                    pending_side, filled_price, price,
-                    filled_price + price, cfg.pair_cost_max,
-                )
-                continue
-
-            # Room check
-            exposure = exposure_up if pending_side == "Up" else exposure_down
-            room = cfg.max_per_side - exposure
-            if room < cfg.min_order_size:
-                logger.info(
-                    "  [re-pair] %s at limit %d/%d → skip",
-                    pending_side, exposure, cfg.max_per_side,
-                )
-                continue
-
-            # Min gap
-            too_close = any(
-                abs(po.price - price) < cfg.min_price_gap
-                for po in ws.pending_orders.values()
-                if po.side == pending_side and po.cancelled_at == 0
-            )
-            if too_close:
-                logger.info(
-                    "  [re-pair] %s price %.4f too close to pending (min_gap=%.4f) → skip",
-                    pending_side, price, cfg.min_price_gap,
-                )
-                continue
-
-            qty = min(remaining, cfg.min_order_size, room)
-            if qty >= cfg.min_order_size:
-                logger.info(
-                    "  [re-pair] %s %d @ %.4f (pair=%s, gap=%d)",
-                    pending_side, qty, price, pair.pair_id, remaining,
-                )
-                return [Decision(side=pending_side, amount=qty, price=price, pair_id=pair.pair_id)]
-
-            logger.info(
-                "  [re-pair] %s qty %d < min_order_size %d → skip",
-                pending_side, qty, cfg.min_order_size,
-            )
-            return None  # one re-pair per tick max
-
-        # ── Phase B: New pair order for remaining unpaired lots ──
+        # ── New pair order for remaining unpaired lots ──
         if unpaired_up == 0 and unpaired_down == 0:
             return None
 
