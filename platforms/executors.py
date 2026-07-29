@@ -374,8 +374,9 @@ class LiveExecutor(OrderExecutor):
 
     async def cancel_all(self, pending_orders: dict[str, PendingOrder]):
         """Soft-cancel all pending orders, wait for in-flight fills, then flush."""
-        if pending_orders:
-            logger.info("  [cancel_all] Cancelling %d orders…", len(pending_orders))
+        if not pending_orders:
+            return
+        logger.info("  [cancel_all] Cancelling %d orders…", len(pending_orders))
         for oid in list(pending_orders):
             await self.cancel(oid)
         # Give in-flight fills time to arrive via UserTradeEvent
