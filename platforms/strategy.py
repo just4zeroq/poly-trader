@@ -79,6 +79,20 @@ class MakerStrategy:
             return decisions  # step2 placed → skip step3
 
         # ════════════════════════════════════════════
+        # Step 3 gate: too many pending orders
+        # ════════════════════════════════════════════
+        pending_cnt = sum(
+            1 for po in ws.pending_orders.values()
+            if po.cancelled_at == 0
+        )
+        if pending_cnt >= cfg.max_pending_orders:
+            logger.info(
+                "  [step3] %d pending >= %d → skip",
+                pending_cnt, cfg.max_pending_orders,
+            )
+            return decisions
+
+        # ════════════════════════════════════════════
         # Step 3 gate: too many single-leg Pairs
         # ════════════════════════════════════════════
         single_cnt = self._count_single_legs(ws)

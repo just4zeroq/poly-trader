@@ -92,6 +92,10 @@ class Config:
     """Max single-leg Pairs allowed before step 3 is blocked.
     After step 2 fusion+repair, if remaining single-leg Pairs >= this,
     skip step 3 to avoid accumulating more unpaired positions."""
+    max_pending_orders: int = field(default_factory=lambda: _env_int("max_pending_orders", 1))
+    """Max total active pending orders across both sides.
+    If pending order count >= this, skip step 3 to prevent stacking
+    multiple orders at different prices."""
 
     # ── Markets ──
     market_slug: str = field(default_factory=lambda: _env("market", "btc-updown-15m"))

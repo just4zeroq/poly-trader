@@ -9,6 +9,7 @@ Order execution:    ``place_limit_order()``, ``cancel_order()`` (via SDK's EIP-7
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time
 import traceback
@@ -33,6 +34,27 @@ from .config import Config
 from .models import MarketInfo, MarketSpec, PendingOrder
 
 logger = logging.getLogger(__name__)
+
+def _cached_get_json(original_method):
+    """Wrap an AsyncTransport.get_json with permanent cache for fixed market data.
+
+    Tick-size and neg-risk are market-level constants that never change.
+    Safe to cache for the lifetime of the process.
+    """
+    cache: dict[tuple, object] = {}
+
+    @functools.wraps(original_method)
+    async def wrapper(path, *, params=None, headers=None):
+        if path in ("/tick-size", "/neg-risk") and params is not None:
+            key = (path, tuple(sorted(params.items())))
+            if key in cache:
+                return cache[key]
+            result = await original_method(path, params=params, headers=headers)
+            cache[key] = result
+            return result
+        return await original_method(path, params=params, headers=headers)
+
+    return wrapper
 
 
 class SdkClient:
@@ -68,6 +90,10 @@ class SdkClient:
             private_key=cfg.private_key,
         )
         logger.info("Secure client created (wallet=%s)", self._secure._ctx.wallet)
+
+        # Cache SDK market data requests (tick-size, neg-risk are fixed per token)
+        for transport in (self._secure._ctx.clob, self._secure._ctx.data):
+            transport.get_json = _cached_get_json(transport.get_json)
 
     @property
     def is_secure(self) -> bool:
