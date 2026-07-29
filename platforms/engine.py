@@ -339,8 +339,6 @@ class TradingEngine:
 
         # Global accumulators
         self._running = False
-        self._cum_pnl = 0.0
-        self._last_window_loss = False
 
         # WS subscription state
         self._sub_handle = None
@@ -542,8 +540,8 @@ class TradingEngine:
                 logger.exception("[%s] Window error: %s", spec.slug_pattern, e)
                 await asyncio.sleep(5)
 
-            # Wait for the next window in this spec's schedule
-            await self._wait_for_next_window(spec)
+            # Skip straight to next window — settlement is fast now
+            continue
 
     async def _wait_for_next_window(self, spec: MarketSpec):
         """Sleep until the next window start for this spec.
@@ -579,18 +577,6 @@ class TradingEngine:
     async def _run_single_window(self, spec: MarketSpec):
         """Execute one full window for a spec: discover → trade → settle."""
         # duration = spec.duration_min * 60
-
-        # ── risk checks before entering window ──
-        if self.cfg.stop_on_window_loss and self._last_window_loss:
-            logger.info("[%s] Skipping window due to previous loss", spec.slug_pattern)
-            self._last_window_loss = False
-            return
-
-        if self._cum_pnl <= self.cfg.max_drawdown:
-            logger.warning("[%s] Cum PnL %.2f <= %.2f → stopping",
-                           spec.slug_pattern, self._cum_pnl, self.cfg.max_drawdown)
-            self._running = False
-            return
 
         # ── market discovery ──
         market = await self.sdk.find_market_for_spec(spec)
@@ -651,8 +637,7 @@ class TradingEngine:
 
             now = time.time()
             remaining = window_end - now
-            #最后5秒结束循环
-            if remaining <= self.cfg.settle_buffer:
+            if remaining <= 0:
                 break
             # PriceCache 内部有个 asyncio.Event，WS 线程收到新 bid/ask 时 event.set() 唤醒它。没有新价格就等 timeout（5s）自动继续。
             #效果：tick 循环不会空转，有新价格立刻处理，没价格 5s 一轮保活。
@@ -781,8 +766,7 @@ class TradingEngine:
                         break
 
         # ── settlement ──
-        pnl = await self._settle_window(win_num, ws_state, market)
-        self._last_window_loss = pnl is not None and pnl < 0
+        await self._settle_window(win_num, ws_state, market)
 
         # Cleanup this window's state
         self._windows.pop(market.slug, None)
@@ -1365,96 +1349,18 @@ class TradingEngine:
     # ── Settlement ──
 
     async def _settle_window(self, win_num: int, ws: WindowState,
-                             market: MarketInfo) -> Optional[float]:
-        """Settle and return PnL (None if winner unknown)."""
+                             market: MarketInfo):
+        """Cancel remaining orders and emit window end (no winner resolution)."""
         logger.info("  [%s] Window ended → settling…", market.slug)
 
         await self.executor.cancel_all(ws.pending_orders)
         ws.pending_orders.clear()
 
-        winner = await self._resolve_winner(market)
-        rpt = ws.report(winner=winner)
-        pnl = rpt.get("pnl")
-        self._cum_pnl += pnl or 0.0
-
+        rpt = ws.report(winner=None)
         await self._emit("window_end", WindowEnd(
             window_num=win_num, slug=market.slug,
-            report=rpt, cum_pnl=round(self._cum_pnl, 2),
+            report=rpt, cum_pnl=0.0,
         ))
-        return pnl
-
-    async def _resolve_winner(self, market: MarketInfo) -> Optional[str]:
-        """Resolve market winner via 3-tier fallback: API → trades → WS midpoint."""
-        # Tier 1: Gamma API (retry up to 30s for oracle to resolve)
-        for attempt in range(10):
-            winner = await self.sdk.get_resolved_winner(market.slug)
-            if winner:
-                logger.info("  [%s] API resolved winner: %s (attempt %d)",
-                            market.slug, winner, attempt + 1)
-                return winner
-            await asyncio.sleep(3)
-
-        # Tier 2: Last trade prices from data API
-        winner = await self._resolve_winner_from_trades(market)
-        if winner:
-            return winner
-
-        # Tier 3: WS midpoint as last resort
-        return self._resolve_winner_from_midpoint(market)
-
-    async def _resolve_winner_from_trades(self, market: MarketInfo) -> Optional[str]:
-        """Try to determine winner from the last trade of each outcome token."""
-        logger.warning("  [%s] API not resolved, querying last trade prices…", market.slug)
-        try:
-            import httpx
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    "https://data-api.polymarket.com/trades",
-                    params={"market": market.condition_id, "limit": 100},
-                    timeout=10,
-                )
-                if resp.status_code != 200:
-                    return None
-                trades = resp.json()
-                if not trades:
-                    return None
-
-                last_up = 0.0
-                last_down = 0.0
-                for t in trades:
-                    if t.get("asset", "") == market.up_token_id or t.get("outcome") == "Up":
-                        last_up = float(t.get("price", 0))
-                    elif t.get("asset", "") == market.down_token_id or t.get("outcome") == "Down":
-                        last_down = float(t.get("price", 0))
-
-                if last_up >= 0.99 and last_down <= 0.01:
-                    logger.info("  [%s] Trades: Up=%.4f Down=%.4f → Up", market.slug, last_up, last_down)
-                    return "Up"
-                if last_down >= 0.99 and last_up <= 0.01:
-                    logger.info("  [%s] Trades: Up=%.4f Down=%.4f → Down", market.slug, last_up, last_down)
-                    return "Down"
-                logger.info("  [%s] Trades ambiguous: Up=%.4f Down=%.4f", market.slug, last_up, last_down)
-        except Exception as e:
-            logger.warning("  [%s] Trades API error: %s", market.slug, e)
-        return None
-
-    def _resolve_winner_from_midpoint(self, market: MarketInfo) -> Optional[str]:
-        """Determine winner from WS midpoints — heuristic last resort."""
-        logger.warning("  [%s] Using WS midpoint as last resort", market.slug)
-        up_snap = self.prices.get(market.up_token_id)
-        down_snap = self.prices.get(market.down_token_id)
-        up_mid = up_snap.mid_price if up_snap else None
-        down_mid = down_snap.mid_price if down_snap else None
-        if not up_mid or not down_mid:
-            return None
-        # Descending confidence thresholds
-        if up_mid > 0.75:       return "Up"
-        if up_mid < 0.25:       return "Down"
-        if up_mid > 0.65 and down_mid < 0.35:  return "Up"
-        if down_mid > 0.65 and up_mid < 0.35:  return "Down"
-        if up_mid > down_mid:   return "Up"
-        if down_mid > up_mid:   return "Down"
-        return None
 
     # ════════════════════════════════════════════════════════════
     # Info

@@ -106,9 +106,6 @@ class Config:
     max_extreme_price: float = field(default_factory=lambda: _env_float("max_extreme_price", 0.90))
     """Skip tick if either side's best_bid exceeds this (market is already settled)."""
     max_imbalance: int = field(default_factory=lambda: _env_int("max_imbalance", 10))
-    """When the difference between Up and Down inventory exceeds this, stop adding to the heavy side."""
-    max_drawdown: float = field(default_factory=lambda: _env_float("max_drawdown", -5.0))
-    stop_on_window_loss: bool = field(default_factory=lambda: _env_bool("stop_on_window_loss", True))
 
     # ── Cancel-replace ──
     cancel_min_age: float = field(default_factory=lambda: _env_float("cancel_min_age", 120.0))
