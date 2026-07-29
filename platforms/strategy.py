@@ -83,7 +83,7 @@ class MakerStrategy:
         # ════════════════════════════════════════════
         pending_cnt = sum(
             1 for po in ws.pending_orders.values()
-            if po.cancelled_at == 0
+            if po.cancelled_at == 0 and po.filled == 0
         )
         if pending_cnt >= cfg.max_pending_orders:
             logger.info(
