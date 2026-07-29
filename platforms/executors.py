@@ -379,7 +379,7 @@ class LiveExecutor(OrderExecutor):
         for oid in list(pending_orders):
             await self.cancel(oid)
         # Give in-flight fills time to arrive via UserTradeEvent
-        await asyncio.sleep(3)
+        await asyncio.sleep(0.3)
         # Remove soft-deleted orders (grace=0 because we already waited above)
         await self.flush_cancelled(grace=0.0)
         # Keep any orders where cancel failed — they may still be live on CLOB
