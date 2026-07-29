@@ -3,8 +3,16 @@ Data models for the trading system.
 """
 
 from __future__ import annotations
+import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Optional
+
+
+def _open_gate() -> asyncio.Event:
+    g = asyncio.Event()
+    g.set()
+    return g
 
 
 # ── Market Spec ──
@@ -213,6 +221,8 @@ class WindowState:
     lots: list = field(default_factory=list)  # list[Lot] — cost records only
     pairs: list = field(default_factory=list)  # list[Pair] — active pairs for this window
     accumulate: int = 0  # step3 cumulative placed qty (shared room for Up+Down)
+    reconcile_gate: asyncio.Event = field(default_factory=lambda: _open_gate())
+    last_activity: float = field(default_factory=time.time)
 
     @property
     def paired_up(self) -> int:

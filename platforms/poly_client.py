@@ -599,6 +599,63 @@ class SdkClient:
             logger.warning("  [sdk] submit_orders EXCEPTION: %s", e)
             return [None] * len(signed_orders)
 
+    # ── Reconciliation ──
+
+    async def get_open_order_ids(self, condition_id: str) -> set[str]:
+        """Return the set of open order IDs for a market (reconciliation helper).
+
+        Only returns orders with remaining > 0.
+        """
+        if not self._secure:
+            return set()
+        ids: set[str] = set()
+        try:
+            paginator = self._secure.list_open_orders(market=condition_id)
+            async for page in paginator:
+                for order in page.items:
+                    remaining = int(order.original_size) - int(order.size_matched)
+                    if remaining > 0:
+                        ids.add(order.id)
+        except Exception as e:
+            logger.warning("get_open_order_ids failed: %s", e)
+        return ids
+
+    async def get_order_filled(self, order_id: str) -> Optional[int]:
+        """Query a single order's filled amount via REST.
+
+        Returns cumulative filled size, or None if the order can't be found.
+        """
+        if not self._secure:
+            return None
+        try:
+            order = await self._secure.get_order(order_id=order_id)
+            return int(order.size_matched) if order else None
+        except Exception as e:
+            logger.debug("get_order(%s…) failed: %s", order_id[:12], e)
+            return None
+
+    async def get_positions(self, condition_id: str,
+                            up_tid: str, down_tid: str) -> dict[str, int]:
+        """Return current positions for a market: {"Up": int, "Down": int}."""
+        if not self._secure:
+            return {"Up": 0, "Down": 0}
+        result = {"Up": 0, "Down": 0}
+        try:
+            paginator = self._secure.list_positions(market=[condition_id])
+            async for page in paginator:
+                for pos in page.items:
+                    if not pos.token_id:
+                        continue
+                    tid = str(pos.token_id)
+                    sz = int(pos.size) if pos.size else 0
+                    if tid == up_tid:
+                        result["Up"] = sz
+                    elif tid == down_tid:
+                        result["Down"] = sz
+        except Exception as e:
+            logger.warning("get_positions failed: %s", e)
+        return result
+
     # ── Cleanup ──
 
     async def close(self):

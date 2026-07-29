@@ -408,6 +408,7 @@ class TradingEngine:
                 name=f"market-{spec.slug_pattern}",
             )
             tg.create_task(self._run_user_ws(), name="user-ws")
+            tg.create_task(self._reconcile_loop(), name="reconcile")
 
     def stop(self):
         self._running = False
@@ -642,6 +643,10 @@ class TradingEngine:
         no_price_log_ts = 0.0
         tick_count = 0
         while self._running:
+            # Reconcile gate — blocks only when reconciliation is actively
+            # applying corrections (rare).  Otherwise passes through instantly.
+            await ws_state.reconcile_gate.wait()
+
             now = time.time()
             remaining = window_end - now
             #最后5秒结束循环
@@ -688,8 +693,10 @@ class TradingEngine:
                 continue
 
             # Cancel-replace: reprice stale pending orders
-            # 移除删除取消订单
-            await self.executor.flush_cancelled()
+            # flush_cancelled() is disabled — reconciliation handles cleanup
+            # instead of blind time-based deletion, so cancelled orders stay
+            # visible for CLOB verification before removal.
+            # await self.executor.flush_cancelled()
             # 取消过期订单
             await self._cancel_stale_pending(ws_state, up_price, down_price)
 
@@ -921,6 +928,262 @@ class TradingEngine:
                 ws.pairs.remove(pair)
                 ws.accumulate = max(0, ws.accumulate - pair.qty)
 
+    # ── State reconciliation ──
+
+    async def _reconcile_loop(self):
+        """Periodic background task: compare local state with CLOB REST API.
+
+        Runs every 30 s independently of the tick loop.  Only pauses the
+        tick loop (via ``reconcile_gate``) when it finds a real discrepancy
+        that needs a correction — and even then only for the brief window
+        while the correction is applied.
+        """
+        interval = self.cfg.reconcile_interval
+        if interval <= 0:
+            return
+
+        while self._running:
+            await asyncio.sleep(interval)
+
+            # ── Find active window ──
+            if not self._windows:
+                continue
+            # Take the first (and typically only) active window
+            market = None
+            ws = None
+            for slug, _ws in self._windows.items():
+                ws = _ws
+                market = self._markets.get(slug)
+                break
+            if ws is None or market is None:
+                continue
+
+            cid = market.condition_id
+            up_tid = market.up_token_id
+            down_tid = market.down_token_id
+            now = time.time()
+
+            # 1. Quiet-period check: skip if there was recent activity
+            if now - ws.last_activity < 5.0:
+                continue
+
+            # 2. Fetch CLOB ground truth (async — tick loop keeps running)
+            fetch_start = time.time()
+            try:
+                clob_open_ids = await self.sdk.get_open_order_ids(cid)
+                clob_positions = await self.sdk.get_positions(cid, up_tid, down_tid)
+            except Exception as e:
+                logger.warning("  [reconcile] Fetch failed: %s", e)
+                continue
+
+            # 3. Snapshot local state (read-only)
+            local_snapshot: dict[str, tuple] = {}  # oid → (filled, cancelled_at, side, price, amount, placed_at)
+            for oid, po in ws.pending_orders.items():
+                local_snapshot[oid] = (po.filled, po.cancelled_at, po.side, po.price, po.amount, po.placed_at)
+
+            # 4. Diff: find orders that need investigation
+            #    (in local but not in CLOB open orders, and not placed during fetch)
+            investigate: list[str] = []
+            for oid, (filled, cancelled_at, side, price, amount, placed_at) in local_snapshot.items():
+                if placed_at > fetch_start:
+                    continue  # was placed during fetch → not in clob_open_ids is expected
+                if cancelled_at > 0 and now - cancelled_at < 3.0:
+                    continue  # recently cancelled, give CLOB time
+                if oid not in clob_open_ids:
+                    investigate.append(oid)
+
+            # 5. Early exit: no suspect orders and no inventory drift
+            inventory_drift = {}
+            for side, tid in [("Up", up_tid), ("Down", down_tid)]:
+                clob_inv = clob_positions.get(side, 0)
+                if clob_inv > ws.inventory[side]:
+                    inventory_drift[side] = (clob_inv, tid)
+
+            if not investigate and not inventory_drift:
+                continue  # all good
+
+            # 6. Query individual order status for suspect orders
+            filled_on_clob: dict[str, int | None] = {}
+            for oid in investigate:
+                try:
+                    filled_on_clob[oid] = await self.sdk.get_order_filled(oid)
+                except Exception:
+                    filled_on_clob[oid] = None
+
+            # 7. Second confirmation: any activity during the fetch?
+            if ws.last_activity > fetch_start:
+                continue  # new fill/place/cancel — differences may be normal
+
+            # 8. Build correction list
+            corrections: list[dict] = []
+            for oid in investigate:
+                if oid not in local_snapshot:
+                    continue
+                local_filled, cancelled_at, side, price, amount, placed_at = local_snapshot[oid]
+                clob_filled = filled_on_clob.get(oid)
+
+                if cancelled_at > 0:
+                    if oid in clob_open_ids:
+                        corrections.append({"action": "revive", "oid": oid, "side": side})
+                    elif clob_filled is not None and clob_filled > local_filled:
+                        corrections.append({"action": "post_cancel_fill", "oid": oid,
+                                            "side": side, "missing": clob_filled - local_filled,
+                                            "price": price})
+                    else:
+                        corrections.append({"action": "remove", "oid": oid})
+                else:
+                    if clob_filled is None:
+                        continue
+                    if clob_filled > local_filled:
+                        corrections.append({"action": "missing_fill", "oid": oid,
+                                            "side": side, "missing": clob_filled - local_filled,
+                                            "price": price, "clob_filled": clob_filled})
+                    elif clob_filled == local_filled:
+                        corrections.append({"action": "ghost", "oid": oid,
+                                            "side": side, "remaining": amount - local_filled,
+                                            "price": price})
+
+            if not corrections and not inventory_drift:
+                continue
+
+            # 9. Pause tick loop, apply corrections
+            ws.reconcile_gate.clear()
+            await asyncio.sleep(0)  # yield so tick loop can hit the gate
+
+            self.executor.start_reconcile()
+            try:
+                applied = 0
+                now = time.time()
+
+                for c in corrections:
+                    oid = c["oid"]
+                    po = ws.pending_orders.get(oid)
+                    if po is None:
+                        continue
+
+                    action = c["action"]
+
+                    if action == "revive":
+                        if po.cancelled_at > 0:
+                            logger.warning(
+                                "  [reconcile] CANCEL FAILED  order=%s… → reviving",
+                                oid[:12],
+                            )
+                            po.cancelled_at = 0
+                            applied += 1
+
+                    elif action == "post_cancel_fill":
+                        if po.cancelled_at > 0:
+                            missing = min(c["missing"], po.remaining)
+                            if missing > 0:
+                                logger.warning(
+                                    "  [reconcile] POST-CANCEL FILL  order=%s…  "
+                                    "side=%s missing=%d",
+                                    oid[:12], c["side"], missing,
+                                )
+                                self.executor._process_fill(ws, po, missing, c["price"])
+                                await self._emit("order_filled", OrderFilled(
+                                    window_num=ws.window_num,
+                                    outcome=c["side"], price=c["price"], amount=missing,
+                                    order_id=oid,
+                                    total_filled=po.filled,
+                                    total_inv_up=ws.inventory["Up"],
+                                    total_inv_down=ws.inventory["Down"],
+                                ))
+                                applied += 1
+                        if oid in ws.pending_orders:
+                            del ws.pending_orders[oid]
+                            applied += 1
+
+                    elif action == "remove":
+                        if po.cancelled_at > 0:
+                            del ws.pending_orders[oid]
+                            applied += 1
+
+                    elif action == "missing_fill":
+                        if po.cancelled_at == 0:
+                            actual_missing = min(c["missing"], po.remaining)
+                            if actual_missing > 0:
+                                logger.warning(
+                                    "  [reconcile] MISSING FILL  order=%s…  "
+                                    "side=%s local=%d clob=%d missing=%d",
+                                    oid[:12], c["side"], po.filled,
+                                    c["clob_filled"], actual_missing,
+                                )
+                                self.executor._process_fill(ws, po, actual_missing, c["price"])
+                                await self._emit("order_filled", OrderFilled(
+                                    window_num=ws.window_num,
+                                    outcome=c["side"], price=c["price"],
+                                    amount=actual_missing, order_id=oid,
+                                    total_filled=po.filled,
+                                    total_inv_up=ws.inventory["Up"],
+                                    total_inv_down=ws.inventory["Down"],
+                                ))
+                                applied += 1
+                            # Fully filled → remove
+                            if po.remaining <= 0 and oid in ws.pending_orders:
+                                del ws.pending_orders[oid]
+                                applied += 1
+                            elif po.cancelled_at == 0:
+                                # Still not resolved → ghost
+                                logger.warning(
+                                    "  [reconcile] GHOST ORDER  order=%s… → cancel",
+                                    oid[:12],
+                                )
+                                po.cancelled_at = now
+                                await self._emit("order_cancelled", OrderCancelled(
+                                    window_num=ws.window_num,
+                                    outcome=c["side"], amount=po.remaining,
+                                    price=c["price"], order_id=oid,
+                                ))
+                                applied += 1
+
+                    elif action == "ghost":
+                        if po.cancelled_at == 0:
+                            logger.warning(
+                                "  [reconcile] GHOST ORDER  order=%s… → cancel",
+                                oid[:12],
+                            )
+                            po.cancelled_at = now
+                            await self._emit("order_cancelled", OrderCancelled(
+                                window_num=ws.window_num,
+                                outcome=c["side"], amount=po.remaining,
+                                price=c["price"], order_id=oid,
+                            ))
+                            applied += 1
+
+                # Inventory drift
+                for side, tid in [("Up", up_tid), ("Down", down_tid)]:
+                    if side not in inventory_drift:
+                        continue
+                    clob_inv, _ = inventory_drift[side]
+                    local_inv = ws.inventory[side]
+                    if clob_inv > local_inv:
+                        delta = clob_inv - local_inv
+                        logger.warning(
+                            "  [reconcile] Inventory drift %s: local=%d clob=%d → +%d",
+                            side, local_inv, clob_inv, delta,
+                        )
+                        snap = self.prices.get(tid)
+                        est_price = snap.mid_price if snap and snap.mid_price else 0.5
+                        ws.inventory[side] = clob_inv
+                        ws.cost[side] += delta * est_price
+                        ws.total_spent += delta * est_price
+                        ws.trades += delta
+                        applied += 1
+
+                if applied:
+                    logger.info(
+                        "  [reconcile] %d corrections applied  "
+                        "pending=%d inv=(U=%d/D=%d)",
+                        applied, len(ws.pending_orders),
+                        ws.inventory["Up"], ws.inventory["Down"],
+                    )
+
+            finally:
+                self.executor.finish_reconcile()
+                ws.reconcile_gate.set()
+
     @staticmethod
     def _clear_pair_order(pair: Pair, side: str = "") -> None:
         """Clear order_id(s) on *pair*.  Clears both sides if *side* is empty."""
@@ -994,6 +1257,7 @@ class TradingEngine:
         if not old_po or old_po.cancelled_at > 0:
             return
         await self.sdk.cancel_order(d.cancel_order_id)
+        ws.last_activity = time.time()
         old_po.cancelled_at = time.time()
         # Clear pair's order_id so new order can link
         for p in ws.pairs:

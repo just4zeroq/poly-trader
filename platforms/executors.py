@@ -108,9 +108,15 @@ class LiveExecutor(OrderExecutor):
         super().__init__()
         # Orphan fill buffer: fills that arrived before pending_orders entry
         self._orphan_fills: dict[str, tuple] = {}
-        # Dedup dict: order_id → timestamp, skip historical fill replay on User WS reconnect
-        # Time-based pruning avoids catastrophic state loss from set.clear()
-        self._fill_seen: dict[str, float] = {}
+        # Dedup dict: order_id → cumulative_matched, skip historical fill replay.
+        # Uses cumulative matched (not timestamp) so partial fills (e.g. 4 then 1)
+        # aren't incorrectly deduped as "already seen".  Only skip when the incoming
+        # matched_amount ≤ previously recorded cumulative amount.
+        self._fill_seen: dict[str, int] = {}
+        # Reconciliation guard: buffer WS fills during REST reconciliation to
+        # avoid conflicts between stale REST data and live WS events.
+        self._reconciling: bool = False
+        self._reconcile_buffer: list[tuple] = []
 
     async def place(self, slug: str, token_id: str, outcome: str,
                     price: float, amount: int,
@@ -135,6 +141,7 @@ class LiveExecutor(OrderExecutor):
             price=price, size=amount,
         )
         if oid:
+            ws.last_activity = time.time()
             ws.pending_orders[oid] = PendingOrder(
                 order_id=oid, token_id=token_id,
                 side=outcome, buy_sell="BUY",
@@ -267,6 +274,7 @@ class LiveExecutor(OrderExecutor):
                 continue
 
             # Accepted — register pending order
+            ws.last_activity = time.time()
             ws.pending_orders[oid] = PendingOrder(
                 order_id=oid, token_id=token_id,
                 side=side, buy_sell="BUY",
@@ -329,6 +337,7 @@ class LiveExecutor(OrderExecutor):
                 po = ws.pending_orders.get(order_id)
                 if po is None:
                     continue
+                ws.last_activity = time.time()
                 po.cancelled_at = time.time()
                 await self.engine._emit("order_cancelled", OrderCancelled(
                     window_num=ws.window_num,
@@ -354,6 +363,7 @@ class LiveExecutor(OrderExecutor):
                 po = ws.pending_orders.get(oid)
                 if po is None:
                     continue
+                ws.last_activity = time.time()
                 po.cancelled_at = time.time()
                 asyncio.ensure_future(self.engine._emit("order_cancelled", OrderCancelled(
                     window_num=ws.window_num,
@@ -428,29 +438,39 @@ class LiveExecutor(OrderExecutor):
 
     # ── _fill_seen time-based pruning ──
 
-    def _prune_fill_seen(self, max_count: int = 10000, max_age: float = 960):
-        """Remove oldest entries when dict exceeds *max_count* or entries exceed *max_age*.
+    def _prune_fill_seen(self, max_count: int = 10000):
+        """Remove oldest entries when dict exceeds *max_count*.
 
-        Keeps dedup coverage for the CLOB replay window (typically ≤5 min after
-        reconnect) while bounding memory.  Called on each new fill when the dict
-        grows past *max_count*.
+        Uses insertion order (Python 3.7+ dict guarantee) as a proxy for age.
+        No longer tracks timestamps — _fill_seen stores cumulative matched instead.
         """
-        now = time.time()
-        stale = [oid for oid, ts in self._fill_seen.items() if now - ts > max_age]
-        for oid in stale:
+        if len(self._fill_seen) <= max_count:
+            return
+        # Drop oldest half (entries at front of ordered dict)
+        excess = len(self._fill_seen) - max_count + (max_count // 4)
+        for oid in list(self._fill_seen)[:excess]:
             del self._fill_seen[oid]
-        if len(self._fill_seen) > max_count:
-            sorted_by_age = sorted(self._fill_seen.items(), key=lambda kv: kv[1])
-            for oid, _ in sorted_by_age[:len(self._fill_seen) - max_count]:
-                del self._fill_seen[oid]
-        if stale:
-            logger.info("  [fill] Pruned %d stale entries from _fill_seen  remaining=%d",
-                        len(stale), len(self._fill_seen))
+        logger.info("  [fill] Pruned %d oldest entries from _fill_seen  remaining=%d",
+                    excess, len(self._fill_seen))
 
     async def handle_user_event(self, event):
         """Process authenticated user channel events for fill tracking."""
         if isinstance(event, UserTradeEvent):
             await self._handle_trade(event.payload)
+
+    # ── Reconciliation guard ──
+
+    def start_reconcile(self):
+        """Buffer subsequent WS fills until finish_reconcile() is called."""
+        self._reconciling = True
+
+    async def finish_reconcile(self):
+        """Replay buffered WS fills, then lift the reconciling flag."""
+        self._reconciling = False
+        buffered = self._reconcile_buffer
+        self._reconcile_buffer = []
+        for payload in buffered:
+            await self._handle_trade(payload)
 
     async def _handle_trade(self, payload):
         """Match a UserTradeEvent against our pending orders.
@@ -459,8 +479,14 @@ class LiveExecutor(OrderExecutor):
           1. Historical fill replay on reconnect → dedup via _fill_seen
           2. Fill arrives before pending_orders entry → orphan buffer
           3. Unknown order (previous instance) → warning
+
+        During reconciliation, events are buffered and replayed afterward
+        to avoid conflicts between stale REST data and live WS fills.
         """
         if not payload.maker_orders:
+            return
+        if self._reconciling:
+            self._reconcile_buffer.append(payload)
             return
         for mo in payload.maker_orders:
             oid = mo.order_id
@@ -469,10 +495,14 @@ class LiveExecutor(OrderExecutor):
             if fill_size <= 0:
                 continue
 
-            # Dedup: skip historical replay from User WS reconnect
-            if oid in self._fill_seen:
-                continue
-            self._fill_seen[oid] = time.time()
+            # Dedup: compute incremental fill vs previous cumulative.
+            # Polymarket WS may replay historical fills on reconnect, and
+            # matched_amount can be either incremental or cumulative per event.
+            prev_cum = self._fill_seen.get(oid, 0)
+            if fill_size <= prev_cum:
+                continue  # true replay — no new fill progress
+            incremental = fill_size - prev_cum
+            self._fill_seen[oid] = fill_size
             if len(self._fill_seen) > 10000:
                 self._prune_fill_seen()
 
@@ -484,11 +514,12 @@ class LiveExecutor(OrderExecutor):
                     continue
                 found = True
 
-                self._process_fill(ws, po, fill_size, fill_price)
+                ws.last_activity = time.time()
+                self._process_fill(ws, po, incremental, fill_price)
 
                 await self.engine._emit("order_filled", OrderFilled(
                     window_num=ws.window_num,
-                    outcome=po.side, price=fill_price, amount=fill_size,
+                    outcome=po.side, price=fill_price, amount=incremental,
                     order_id=oid,
                     total_filled=po.filled,
                     total_inv_up=ws.inventory["Up"],

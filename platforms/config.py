@@ -124,6 +124,10 @@ class Config:
     max_consecutive_failures: int = field(default_factory=lambda: _env_int("max_consecutive_failures", 15))
     """Stop trying after this many consecutive ticks where all orders are rejected (balance likely depleted)."""
 
+    # ── Reconciliation ──
+    reconcile_interval: float = field(default_factory=lambda: _env_float("reconcile_interval", 60.0))
+    """Seconds between REST-based state reconciliations. 0 disables."""
+
     # ── Connection ──
     ws_reconnect_delay: float = field(default_factory=lambda: _env_float("ws_reconnect_delay", 3.0))
     min_tick_interval: float = field(default_factory=lambda: _env_float("min_tick_interval", 1.0))

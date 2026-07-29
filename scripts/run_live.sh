@@ -5,10 +5,8 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIR"
 export PYTHONPATH="${DIR}/..:${PYTHONPATH:-}"
 
-# ── Load .env into shell environment ──
-set -a
-source "${DIR}/.env" 2>/dev/null || true
-set +a
+# ── Load .env values needed by this script ──
+POLY_MARKET=$(grep -oP '^POLY_MARKET=\K.*' "${DIR}/.env" 2>/dev/null || true)
 
 # ── Config ──
 PIDFILE="/tmp/poly_trader_live.pid"
