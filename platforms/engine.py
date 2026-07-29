@@ -348,6 +348,8 @@ class TradingEngine:
 
         # Tick throttling
         self._last_tick_time: float = 0.0
+        # Trade history API rate-limit: at most once per 60s
+        self._last_trade_history_check: float = 0.0
 
         # Event system
         self._event_handlers: dict[str, list[Callable]] = {}
@@ -967,6 +969,11 @@ class TradingEngine:
             if now - ws.last_activity < 5.0:
                 continue
 
+            logger.debug(
+                "  [reconcile] Fetching CLOB state  pending=%d inv=(U=%d/D=%d)",
+                len(ws.pending_orders), ws.inventory["Up"], ws.inventory["Down"],
+            )
+
             # 2. Fetch CLOB ground truth (async — tick loop keeps running)
             fetch_start = time.time()
             try:
@@ -999,8 +1006,47 @@ class TradingEngine:
                 if clob_inv > ws.inventory[side]:
                     inventory_drift[side] = (clob_inv, tid)
 
+            # 5b. Trade history cross-reference (at most once per 60s):
+            #     catches fills that both User WS *and* CLOB positions API miss.
             if not investigate and not inventory_drift:
-                continue  # all good
+                now_ts = time.time()
+                if now_ts - self._last_trade_history_check > 60.0:
+                    self._last_trade_history_check = now_ts
+                    trade_history = await self.sdk.get_trade_history(
+                        cid, self.cfg.wallet_address, ws.start_time,
+                    )
+                    if trade_history:
+                        trade_qty = {"Up": 0, "Down": 0}
+                        for t in trade_history:
+                            asset = t.get("asset", "")
+                            try:
+                                sz = int(t.get("size", 0))
+                            except (ValueError, TypeError):
+                                sz = 0
+                            if asset == up_tid:
+                                trade_qty["Up"] += sz
+                            elif asset == down_tid:
+                                trade_qty["Down"] += sz
+
+                        for side, tid in [("Up", up_tid), ("Down", down_tid)]:
+                            if trade_qty[side] > ws.inventory[side]:
+                                inventory_drift[side] = (trade_qty[side], tid)
+                                logger.warning(
+                                    "  [reconcile] Trade history %s: local=%d trades=%d",
+                                    side, ws.inventory[side], trade_qty[side],
+                                )
+
+            if not investigate and not inventory_drift:
+                logger.debug(
+                    "  [reconcile] All clear  pending=%d inv=(U=%d/D=%d) → no diffs",
+                    len(ws.pending_orders), ws.inventory["Up"], ws.inventory["Down"],
+                )
+                continue
+
+            logger.info(
+                "  [reconcile] Diffs found  suspect_orders=%d drift=%s  → investigating",
+                len(investigate), list(inventory_drift.keys()) or "none",
+            )
 
             # 6. Query individual order status for suspect orders
             filled_on_clob: dict[str, int | None] = {}
@@ -1012,7 +1058,12 @@ class TradingEngine:
 
             # 7. Second confirmation: any activity during the fetch?
             if ws.last_activity > fetch_start:
-                continue  # new fill/place/cancel — differences may be normal
+                logger.info(
+                    "  [reconcile] Activity during fetch → discarding  "
+                    "(last_activity %.1fs after fetch_start)",
+                    ws.last_activity - fetch_start,
+                )
+                continue
 
             # 8. Build correction list
             corrections: list[dict] = []
@@ -1044,7 +1095,16 @@ class TradingEngine:
                                             "price": price})
 
             if not corrections and not inventory_drift:
+                logger.debug(
+                    "  [reconcile] Investigated %d orders → no real diffs",
+                    len(investigate),
+                )
                 continue
+
+            logger.info(
+                "  [reconcile] Applying corrections  actions=%d drift=%s  → pausing tick",
+                len(corrections), list(inventory_drift.keys()) or "none",
+            )
 
             # 9. Pause tick loop, apply corrections
             ws.reconcile_gate.clear()
@@ -1181,7 +1241,7 @@ class TradingEngine:
                     )
 
             finally:
-                self.executor.finish_reconcile()
+                await self.executor.finish_reconcile()
                 ws.reconcile_gate.set()
 
     @staticmethod

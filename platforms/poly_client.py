@@ -656,6 +656,50 @@ class SdkClient:
             logger.warning("get_positions failed: %s", e)
         return result
 
+    async def get_trade_history(
+        self, condition_id: str, user_address: str,
+        start_time: float, limit: int = 1000,
+    ) -> list[dict]:
+        """Query Polymarket Data API for recent trades involving our address.
+
+        Filters by market and user (maker or taker).  Used by reconciliation
+        to catch fills that the User WS missed *and* that the CLOB positions
+        API hasn't reflected yet (stale API lag).
+
+        Returns list of trade dicts, or [] on error/not-found.
+        Each trade has: order_id, asset (token_id), price, size, maker, taker, timestamp.
+        """
+        import httpx
+        from httpx import HTTPError
+        try:
+            params = {
+                "market": condition_id,
+                "user": user_address,
+                "takerOnly": "false",
+                "start": str(int(start_time)),
+                "limit": str(limit),
+            }
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    "https://data-api.polymarket.com/trades",
+                    params=params,
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        "get_trade_history: HTTP %d  params=%s",
+                        resp.status_code, {k: v for k, v in params.items() if k != "user"},
+                    )
+                    return []
+                trades: list[dict] = resp.json()
+                logger.info(
+                    "get_trade_history: %d trades for market=%s",
+                    len(trades), condition_id[:16],
+                )
+                return trades
+        except (HTTPError, Exception) as e:
+            logger.warning("get_trade_history failed: %s", e)
+            return []
+
     # ── Cleanup ──
 
     async def close(self):
