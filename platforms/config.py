@@ -75,12 +75,20 @@ class Config:
     wallet_address: str = field(default_factory=lambda: _env("wallet_address"))
 
     # ── Strategy ──
-    pair_cost_max: float = field(default_factory=lambda: _env_float("pair_cost_max", 1.0))
-    """Max cost for a paired order (up_price + down_price). New pairs and re-pairs
-    skip when cost exceeds this threshold.  1.0 = break-even."""
-    pair_cost_mid: float = field(default_factory=lambda: _env_float("pair_cost_mid", 0.97))
-    """Tighter cost cap when both prices are in the 0.40–0.60 mid-range,
-    where the edge is thinner.  Applies to step3 new pairs only."""
+    pair_cost_target: float = field(default_factory=lambda: _env_float("pair_cost_target", 0.98))
+    """Target cost for paired orders when both prices are within the normal
+    threshold range (pair_cost_threshold_low ~ pair_cost_threshold_high).
+    One side uses maker price, the other is derived as target - maker,
+    ensuring total cost is predictable."""
+    pair_cost_target_extreme: float = field(default_factory=lambda: _env_float("pair_cost_target_extreme", 0.99))
+    """Target cost when one or both prices are at extreme levels
+    (≤ threshold_low or ≥ threshold_high)."""
+    pair_cost_threshold_low: float = field(default_factory=lambda: _env_float("pair_cost_threshold_low", 0.30))
+    """Lower bound of the normal price range.  If either side's price is
+    ≤ this, the extreme target is used instead of the normal target."""
+    pair_cost_threshold_high: float = field(default_factory=lambda: _env_float("pair_cost_threshold_high", 0.70))
+    """Upper bound of the normal price range.  If either side's price is
+    ≥ this, the extreme target is used instead of the normal target."""
     max_per_side: int = field(default_factory=lambda: _env_int("max_per_side", 20))
     aggressiveness: float = field(default_factory=lambda: _env_float("aggressiveness", 0.3))
     """Aggressiveness 0-1 — higher = more aggressive pricing (closer to best_ask)."""

@@ -123,7 +123,7 @@ class MakerStrategy:
           - Partial fill (e.g. up_filled=3, down_filled=0)
           - Fully filled one side (e.g. up_filled=5, down_filled=0)
 
-        Fusion condition: up_price + down_price <= pair_cost_max (1.0)
+        Fusion condition: up_price + down_price <= pair_cost_target_extreme.
         Must be one Up-leg + one Down-leg.  Maximizes matches by pairing
         expensive Up-legs with cheap Down-legs (greedy).
 
@@ -169,7 +169,7 @@ class MakerStrategy:
             for di, down_pair in enumerate(down_legs):
                 if di in used_down:
                     continue
-                if up_pair.up_price + down_pair.down_price > cfg.pair_cost_max:
+                if up_pair.up_price + down_pair.down_price > cfg.pair_cost_target_extreme:
                     continue
 
                 # ── Match: dissolve down_pair into up_pair ──
@@ -244,7 +244,7 @@ class MakerStrategy:
         After step1 fusion, remaining single-leg Pairs are ones that
         couldn't be fused (no compatible opposite-leg Pair).  Place a
         single order on the missing side with:
-          - Cost check:  existing_lock_price + market_price < pair_cost_max
+          - Cost check:  existing_lock_price + market_price < pair_cost_target_extreme
           - Min gap:     market price not too close to pending orders
           - Qty:         min_order_size
 
@@ -267,21 +267,21 @@ class MakerStrategy:
             # ── single-leg from here ──
             if has_up and not has_down:
                 # Missing Down side
-                if pair.up_price + down_price >= cfg.pair_cost_max:
+                if pair.up_price + down_price >= cfg.pair_cost_target_extreme:
                     logger.info(
                         "  [repair] Pair %s cost %.4f + %.4f = %.4f >= %.2f → skip Down",
                         pair.pair_id, pair.up_price, down_price,
-                        pair.up_price + down_price, cfg.pair_cost_max,
+                        pair.up_price + down_price, cfg.pair_cost_target_extreme,
                     )
                     continue
                 side, price = "Down", down_price
             else:  # not has_up and has_down
                 # Missing Up side
-                if up_price + pair.down_price >= cfg.pair_cost_max:
+                if up_price + pair.down_price >= cfg.pair_cost_target_extreme:
                     logger.info(
                         "  [repair] Pair %s cost %.4f + %.4f = %.4f >= %.2f → skip Up",
                         pair.pair_id, up_price, pair.down_price,
-                        up_price + pair.down_price, cfg.pair_cost_max,
+                        up_price + pair.down_price, cfg.pair_cost_target_extreme,
                     )
                     continue
                 side, price = "Up", up_price
@@ -347,7 +347,8 @@ class MakerStrategy:
           - Shared room: max_per_side - accumulate < min_order_size → skip
           - Atomic pre-check: Up or Down price too close to pending → skip both
           - Imbalance: exposure or filled inventory gap too large → skip both
-          - Pair cost cap: up_price + down_price > pair_cost_max → skip
+          - Pair cost cap: up_price + down_price > target_extreme → skip
+            (should not happen — pricing already guarantees this)
         """
         decisions: list[Decision] = []
         cfg = self.cfg
@@ -401,14 +402,13 @@ class MakerStrategy:
             )
             return decisions
 
-        # ── Pair cost cap ──
-        cost_cap = cfg.pair_cost_max
-        if 0.40 <= up_price <= 0.60 and 0.40 <= down_price <= 0.60:
-            cost_cap = min(cost_cap, cfg.pair_cost_mid)
-        if up_price + down_price > cost_cap:
+        # ── Pair cost safety check ──
+        # Prices already guaranteed by _resolve_pair_prices anchor+target logic.
+        # This is a safety net in case of rounding edge cases.
+        if up_price + down_price > cfg.pair_cost_target_extreme:
             logger.info(
-                "  [step3] Pair cost %.4f > %.2f → skip (would lock loss)",
-                up_price + down_price, cost_cap,
+                "  [step3] Pair cost %.4f > %.2f → skip (pricing anomaly)",
+                up_price + down_price, cfg.pair_cost_target_extreme,
             )
             return decisions
 

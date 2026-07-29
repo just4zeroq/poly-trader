@@ -777,10 +777,19 @@ class TradingEngine:
         up_tick: float = 0.01, down_tick: float = 0.01,
         ws_state: Optional[WindowState] = None,
     ) -> tuple[Optional[float], Optional[float]]:
-        """Resolve maker prices for Up+Down, or (None, None) to skip the tick.
+        """Resolve pair prices with anchor+target logic.
 
-        Validates both orderbook snapshots are fresh and tradable, then rounds
-        to tick size and checks the pair doesn't lock in a guaranteed loss.
+        On each tick:
+          1. Compute raw maker prices for both sides
+          2. Check price range: any side at extreme → use extreme target,
+             else use normal target
+          3. Choose anchor side: normal range → anchor higher price (aggressive
+             derived side); extreme → anchor lower price (safer)
+          4. Anchor side uses maker price, derive the other as target - anchor
+          5. Round both to tick size
+
+        This guarantees total cost ≈ target, and the derived side naturally
+        lands near the opposite book's ask (aggressive, high fill probability).
         """
         up_snap = self.prices.get(up_token_id)
         down_snap = self.prices.get(down_token_id)
@@ -793,14 +802,45 @@ class TradingEngine:
                 and self._snapshot_ok(down_snap, slug, "Down")):
             return None, None
 
-        up_price = self.sdk.round_to_tick(self._maker_price(up_snap), up_tick)
-        down_price = self.sdk.round_to_tick(self._maker_price(down_snap), down_tick)
+        cfg = self.cfg
+        up_maker = self._maker_price(up_snap)
+        down_maker = self._maker_price(down_snap)
 
-        if up_price + down_price > self.cfg.pair_cost_max:
-            logger.info("[%s] Price sum %.4f > %.2f → skip", slug,
-                        up_price + down_price, self.cfg.pair_cost_max)
+        # Determine price range mode
+        tl, th = cfg.pair_cost_threshold_low, cfg.pair_cost_threshold_high
+        up_extreme = up_maker <= tl or up_maker >= th
+        down_extreme = down_maker <= tl or down_maker >= th
+
+        if up_extreme or down_extreme:
+            target = cfg.pair_cost_target_extreme
+            # Extreme → anchor lower price (more conservative)
+            anchor_up = up_maker <= down_maker
+        else:
+            target = cfg.pair_cost_target
+            # Normal → anchor higher price (derived side is aggressive)
+            anchor_up = up_maker >= down_maker
+
+        # Anchor side uses maker price, derive the other as target - anchor
+        if anchor_up:
+            up_price = self.sdk.round_to_tick(up_maker, up_tick)
+            down_raw = target - up_price
+            down_price = self.sdk.round_to_tick(down_raw, down_tick)
+        else:
+            down_price = self.sdk.round_to_tick(down_maker, down_tick)
+            up_raw = target - down_price
+            up_price = self.sdk.round_to_tick(up_raw, up_tick)
+
+        # Safety: invalid prices → skip
+        if up_price <= 0 or down_price <= 0:
+            logger.info("[%s] Invalid prices Up=%.4f Down=%.4f → skip", slug,
+                        up_price, down_price)
             return None, None
 
+        logger.debug(
+            "[%s] Prices up=%.4f down=%.4f sum=%.4f target=%.2f anchor=%s",
+            slug, up_price, down_price, up_price + down_price, target,
+            "Up" if anchor_up else "Down",
+        )
         return up_price, down_price
 
     def _snapshot_ok(self, snap: OrderBookSnapshot, slug: str, side: str) -> bool:
