@@ -54,6 +54,8 @@ from .models import (
     WindowState,
 )
 from .strategy import MakerStrategy
+from .predictive import PredictiveMakerStrategy
+from .predictor import BinanceFeed, Predictor
 
 logger = logging.getLogger(__name__)
 
@@ -327,7 +329,14 @@ class TradingEngine:
         self.executor.engine = self
         self.sdk = SdkClient(cfg)
         self.prices = PriceCache()
-        self.strategy = MakerStrategy(cfg)
+        self.feed: Optional[BinanceFeed] = None
+        self.predictor: Optional[Predictor] = None
+        if cfg.predictive_enabled:
+            self.feed = BinanceFeed()
+            self.predictor = Predictor(cfg)
+            self.strategy = PredictiveMakerStrategy(cfg, self.predictor)
+        else:
+            self.strategy = MakerStrategy(cfg)
 
         # Multi-market state: keyed by slug_pattern (e.g. "btc-updown-5m")
         self._windows: dict[str, WindowState] = {}   # slug → current window state
@@ -409,6 +418,10 @@ class TradingEngine:
             )
             tg.create_task(self._run_user_ws(), name="user-ws")
             tg.create_task(self._reconcile_loop(), name="reconcile")
+            if self.cfg.predictive_enabled and self.feed is not None:
+                tg.create_task(self._run_btc_price_cache(), name="btc-price")
+        if self.feed is not None:
+            await self.feed.close()
 
     def stop(self):
         self._running = False
@@ -518,6 +531,33 @@ class TradingEngine:
                     logger.warning("User WS error: %s, reconnecting…", e)
                     await asyncio.sleep(self.cfg.ws_reconnect_delay)
 
+    async def _run_btc_price_cache(self):
+        """Background: keep the cached Binance BTC price fresh via WebSocket push.
+
+        HTTP seed once, then stream over WS; on disconnect do one HTTP fallback
+        and reconnect.  Never blocks the tick loop.
+        """
+        if self.feed is None or self.predictor is None:
+            return
+        # Initial HTTP seed
+        try:
+            self.predictor.set_btc(await self.feed.ticker_price())
+        except Exception as e:
+            logger.warning("[predict] initial BTC fetch failed: %s", e)
+        while self._running:
+            try:
+                async for price in self.feed.stream_btc_price():
+                    self.predictor.set_btc(price)
+            except asyncio.CancelledError:
+                raise  # shutdown — propagate cancellation, don't reconnect
+            except Exception as e:
+                logger.warning("[predict] BTC WS disconnected: %s", e)
+                try:
+                    self.predictor.set_btc(await self.feed.ticker_price())
+                except Exception as e2:
+                    logger.warning("[predict] BTC HTTP fallback failed: %s", e2)
+                await asyncio.sleep(self.cfg.ws_reconnect_delay)
+
     # ════════════════════════════════════════════════════════════
     # Per-market window lifecycle
     # ════════════════════════════════════════════════════════════
@@ -603,6 +643,9 @@ class TradingEngine:
             up_token_id=market.up_token_id,
             down_token_id=market.down_token_id,
         ))
+
+        if self.cfg.predictive_enabled and self.feed is not None:
+            asyncio.create_task(self._load_window_features(market))
 
         # Cancel lingering orders from a previous instance (scoped to this market)
         # if self.sdk.is_secure and market.condition_id:
@@ -771,6 +814,32 @@ class TradingEngine:
         # Cleanup this window's state
         self._windows.pop(market.slug, None)
         self._markets.pop(market.slug, None)
+
+    async def _load_window_features(self, market: MarketInfo):
+        """Fetch and cache window-start features (5m klines) for the predictor.
+
+        Retries a few times: Binance may not have formed the window-start
+        candle if we discovered the window immediately at open.
+        """
+        for attempt in range(5):
+            try:
+                feat = await self.feed.window_features(market.window_start)
+                if feat is not None:
+                    open_, prior15, prior1h, sigma5 = feat
+                    self.predictor.set_window(
+                        market.window_start, open_, prior15, prior1h, sigma5)
+                    logger.info(
+                        "[predict] window %d open=%.2f prior15=%+.4f%% "
+                        "prior1h=%+.4f%% sigma5=%.3f%%",
+                        market.window_start, open_, prior15, prior1h, sigma5)
+                    return
+            except Exception as e:
+                logger.warning("[predict] feature fetch attempt %d failed: %s",
+                               attempt + 1, e)
+            await asyncio.sleep(5)
+        logger.warning(
+            "[predict] window %d features unavailable — favorite orders disabled this window",
+            market.window_start)
 
     def _resolve_pair_prices(
         self, up_token_id: str, down_token_id: str, slug: str,
@@ -1309,9 +1378,10 @@ class TradingEngine:
         """Place a new Up+Down pair — sign both, submit together. Returns True if any side OK."""
         up_d = next((d for d in step3 if d.side == "Up"), None)
         down_d = next((d for d in step3 if d.side == "Down"), None)
+
+        # Predictive single-leg favorite: only one side present
         if up_d is None or down_d is None:
-            logger.warning("step3 pair missing side: Up=%s Down=%s", up_d, down_d)
-            return False
+            return await self._place_step3_single(market, ws, up_d or down_d)
 
         pair = Pair(
             pair_id=f"pair_{ws.window_num}_{len(ws.pairs)}",
@@ -1334,6 +1404,34 @@ class TradingEngine:
                     "Up" if up_ok else "-", "Down" if down_ok else "-",
                     pair.pair_id)
         return up_ok or down_ok
+
+    async def _place_step3_single(self, market: MarketInfo, ws: WindowState,
+                                  d: Decision) -> bool:
+        """Place a single-leg order (predictive favorite) — creates a single-leg Pair.
+
+        The missing leg's price is left 0.0; the strategy pairs it later via
+        step-2 repair once the favorite fills.
+        """
+        pair = Pair(
+            pair_id=f"pair_{ws.window_num}_{len(ws.pairs)}",
+            up_price=d.price if d.side == "Up" else 0.0,
+            down_price=d.price if d.side == "Down" else 0.0,
+            qty=d.amount,
+        )
+        ws.pairs.append(pair)
+        d.pair_id = pair.pair_id
+
+        token_id = market.up_token_id if d.side == "Up" else market.down_token_id
+        ok = await self._place_order(
+            market.slug, token_id, d.side, d.price, d.amount,
+            pair_id=pair.pair_id,
+        )
+        if ok:
+            ws.accumulate += d.amount
+        logger.info("  [engine] step3 single %s=%d@%.4f %s pair=%s",
+                    d.side, d.amount, d.price,
+                    "OK" if ok else "FAIL", pair.pair_id)
+        return ok
 
     async def _handle_cancel_replace(self, d: Decision, ws: WindowState):
         """Cancel the old blocking order and clear pair state (no dissolve)."""
