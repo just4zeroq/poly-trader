@@ -128,7 +128,15 @@ class BinanceFeed:
             return None
         prior15 = (open_ / d[epoch * 1000 - 900000][1] - 1.0) * 100.0
         prior1h = (open_ / d[epoch * 1000 - 3600000][1] - 1.0) * 100.0
-        prices5 = [d[epoch * 1000 - t][0] for t in range(300000, 3600001, 300000)]
+        # σ5 needs the 12 pre-window 5m open prices (T−60m..T−5m). Sparse
+        # candles → None (safety over silence): a bogus sigma would distort k_eff.
+        prices5 = []
+        for t in range(300000, 3600001, 300000):
+            if (epoch * 1000 - t) not in d:
+                return None
+            prices5.append(d[epoch * 1000 - t][0])
+        if len(prices5) < 2:
+            return None
         rets = [math.log(prices5[i] / prices5[i - 1]) for i in range(1, len(prices5))]
         mean = sum(rets) / len(rets)
         sigma5 = (sum((x - mean) ** 2 for x in rets) / len(rets)) ** 0.5 * 100.0
