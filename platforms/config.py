@@ -133,6 +133,16 @@ class Config:
     max_consecutive_failures: int = field(default_factory=lambda: _env_int("max_consecutive_failures", 15))
     """Stop trying after this many consecutive ticks where all orders are rejected (balance likely depleted)."""
 
+    # ── Predictive integration (poly_predict P_fair model) ──
+    predictive_enabled: bool = field(default_factory=lambda: _env_bool("predictive", False))
+    """Enable predictive single-leg-first strategy (buy P_fair favorite, pair after fill)."""
+    pred_conf_threshold: float = field(default_factory=lambda: _env_float("pred_conf_threshold", 0.05))
+    """Min |P_fair - 0.5| to place a favorite order."""
+    pred_start_elapsed: float = field(default_factory=lambda: _env_float("pred_start_elapsed", 60.0))
+    """Seconds into the window before the first favorite order."""
+    pred_btc_max_age: float = field(default_factory=lambda: _env_float("pred_btc_max_age", 8.0))
+    """Skip predictive decisions when the cached BTC price is older than this."""
+
     # ── Reconciliation ──
     reconcile_interval: float = field(default_factory=lambda: _env_float("reconcile_interval", 60.0))
     """Seconds between REST-based state reconciliations. 0 disables."""
