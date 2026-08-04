@@ -54,8 +54,11 @@ class PredictiveMakerStrategy(MakerStrategy):
         # Step 1: fuse single-leg pairs (safety net — inherits maker fusion)
         self._fuse_pairs(ws)
 
-        # Step 2: pair any filled favorite (place the missing leg)
-        decisions = self._step2_repair(ws, up_price, down_price)
+        # Step 2: pair ONLY filled favorites (place the missing leg).
+        # require_filled=True — a still-pending favorite is left unpaired
+        # until it actually fills, so we never accumulate a naked non-favorite
+        # leg (the single-leg risk is accepted only on the favorite side).
+        decisions = self._step2_repair(ws, up_price, down_price, require_filled=True)
         if decisions:
             return decisions  # awaiting pairing — hold off on a new favorite
 

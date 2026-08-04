@@ -1,5 +1,5 @@
 from poly_trader.platforms.config import Config
-from poly_trader.platforms.models import Pair, WindowState
+from poly_trader.platforms.models import Pair, PendingOrder, WindowState
 from poly_trader.platforms.predictive import PredictiveMakerStrategy
 from poly_trader.platforms.predictor import Predictor
 
@@ -50,6 +50,36 @@ def test_repair_pairs_filled_favorite():
     assert len(decisions) == 1
     assert decisions[0].side == "Down"
     assert decisions[0].price == 0.43
+    assert decisions[0].pair_id == "pair_1_0"
+
+
+def test_pending_favorite_not_paired_until_filled():
+    strat, cfg = make_strategy(btc_price=100.3)
+    ws = make_ws(cfg)
+    # Favorite placed but NOT yet filled (pending order only, no fills) →
+    # the pairing must wait until the favorite actually fills.
+    ws.pairs.append(Pair(pair_id="pair_1_0", up_price=0.55, down_price=0.0,
+                         qty=5, up_filled=0, down_filled=0,
+                         up_order_id="ord_up_1"))
+    ws.pending_orders["ord_up_1"] = PendingOrder(
+        order_id="ord_up_1", token_id="t_up", side="Up",
+        buy_sell="BUY", price=0.55, amount=5)
+    assert strat.decide(ws, up_price=0.55, down_price=0.43, remaining_time=800.0) == []
+
+
+def test_partially_filled_favorite_is_paired():
+    strat, cfg = make_strategy(btc_price=100.3)
+    ws = make_ws(cfg)
+    # Favorite partially filled (3/5) → committed to the side → pair now
+    ws.pairs.append(Pair(pair_id="pair_1_0", up_price=0.55, down_price=0.0,
+                         qty=5, up_filled=3, down_filled=0,
+                         up_order_id="ord_up_1"))
+    ws.pending_orders["ord_up_1"] = PendingOrder(
+        order_id="ord_up_1", token_id="t_up", side="Up",
+        buy_sell="BUY", price=0.55, amount=5, filled=3)
+    decisions = strat.decide(ws, up_price=0.55, down_price=0.43, remaining_time=800.0)
+    assert len(decisions) == 1
+    assert decisions[0].side == "Down"
     assert decisions[0].pair_id == "pair_1_0"
 
 

@@ -238,6 +238,7 @@ class MakerStrategy:
     def _step2_repair(
         self, ws: WindowState,
         up_price: float, down_price: float,
+        require_filled: bool = False,
     ) -> list[Decision]:
         """Repair single-leg Pairs — place the missing side.
 
@@ -248,6 +249,12 @@ class MakerStrategy:
           - Min gap:     market price not too close to pending orders
           - Qty:         min_order_size
 
+        *require_filled*: when True (predictive single-leg-first flow), only
+        repair pairs whose existing leg has actual fills — a fresh favorite
+        that is still pending and unfilled is left alone until it fills.
+        Default False preserves the maker strategy's behavior of treating
+        any active leg (pending or filled) as repairable.
+
         Returns list of decisions (each with pair_id).  If non-empty,
         engine places them individually (not batch pair).
         """
@@ -257,8 +264,13 @@ class MakerStrategy:
         qty = cfg.min_order_size
 
         for pair in list(ws.pairs):
-            has_up = self._leg_is_active(pair, "Up", pending)
-            has_down = self._leg_is_active(pair, "Down", pending)
+            if require_filled:
+                # Predictive: pair only after the favorite has real fills.
+                has_up = pair.up_filled > 0
+                has_down = pair.down_filled > 0
+            else:
+                has_up = self._leg_is_active(pair, "Up", pending)
+                has_down = self._leg_is_active(pair, "Down", pending)
 
             if has_up and has_down:
                 continue  # already two-leg
