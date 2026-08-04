@@ -142,6 +142,10 @@ class Config:
     """Seconds into the window before the first favorite order."""
     pred_btc_max_age: float = field(default_factory=lambda: _env_float("pred_btc_max_age", 8.0))
     """Skip predictive decisions when the cached BTC price is older than this."""
+    pred_require_filled: bool = field(default_factory=lambda: _env_bool("pred_require_filled", True))
+    """Require the favorite leg to fill before the pairing order is placed.
+    False = pair immediately (next tick) regardless of fill — faster price
+    lock, but risks a naked non-favorite leg if the favorite never fills."""
 
     # ── Reconciliation ──
     reconcile_interval: float = field(default_factory=lambda: _env_float("reconcile_interval", 60.0))

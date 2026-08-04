@@ -67,6 +67,27 @@ def test_pending_favorite_not_paired_until_filled():
     assert strat.decide(ws, up_price=0.55, down_price=0.43, remaining_time=800.0) == []
 
 
+def test_pending_favorite_paired_when_require_filled_disabled():
+    cfg = Config()
+    cfg.pred_require_filled = False
+    predictor = Predictor(cfg)
+    predictor.set_window(1700000000, 100.0, 0.1, 0.2, 0.2)
+    predictor.set_btc(100.3)
+    strat = PredictiveMakerStrategy(cfg, predictor)
+    ws = make_ws(cfg)
+    # Favorite placed, NOT yet filled — with the gate off, pair immediately
+    ws.pairs.append(Pair(pair_id="pair_1_0", up_price=0.55, down_price=0.0,
+                         qty=5, up_filled=0, down_filled=0,
+                         up_order_id="ord_up_1"))
+    ws.pending_orders["ord_up_1"] = PendingOrder(
+        order_id="ord_up_1", token_id="t_up", side="Up",
+        buy_sell="BUY", price=0.55, amount=5)
+    decisions = strat.decide(ws, up_price=0.55, down_price=0.43, remaining_time=800.0)
+    assert len(decisions) == 1
+    assert decisions[0].side == "Down"
+    assert decisions[0].pair_id == "pair_1_0"
+
+
 def test_partially_filled_favorite_is_paired():
     strat, cfg = make_strategy(btc_price=100.3)
     ws = make_ws(cfg)
