@@ -56,7 +56,10 @@ def test_favorite_requires_fresh_btc_and_window():
     assert p.favorite(300.0) is None
 
 
-def test_config_defaults():
+def test_config_defaults(monkeypatch):
+    # Hermetic: clear POLY_PREDICTIVE so the default assertion doesn't depend
+    # on the live .env (which sets it true for production runs).
+    monkeypatch.delenv("POLY_PREDICTIVE", raising=False)
     cfg = Config()
     assert cfg.predictive_enabled is False
     assert cfg.pred_conf_threshold == 0.05
