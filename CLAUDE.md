@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-WebSocket-based market making bot trading Polymarket BTC 15m binary options (Up/Down). Pair-first strategy: free pair existing lots, re-pair incomplete pairs, place new pairs, then normal independent logic.
+WebSocket-based market making bot trading Polymarket BTC 15m binary options (Up/Down). V4 predictive strategy: buy the P_fair favorite → hedge the light side on fill → repeat when flat. Reconciliation = WS fills write-through `auth_inv` + 2s CLOB position poll.
 
 ## Code Structure
 
@@ -11,10 +11,10 @@ poly_trader/
 ├── platform/                  # Core trading (strategy + engine)
 │   ├── main.py                CLI entry: info, run, check
 │   ├── config.py              All config from .env (POLY_* / POLYMARKET_*)
-│   ├── engine.py              Core engine — WS lifecycle, tick loop, settlement
-│   ├── strategy.py            Pair-first maker strategy (V3)
+│   ├── engine.py              Core engine — WS lifecycle, tick loop, position poll, settlement
+│   ├── strategy.py            V4 predictive strategy (favorite → hedge → flat)
 │   ├── executors.py           LiveExecutor — real Polymarket orders + user WS fill tracking
-│   ├── models.py              Data models — MarketInfo, WindowState, OrderBookSnapshot, Pair
+│   ├── models.py              Data models — MarketInfo, WindowState, OrderBookSnapshot
 ├── tools/
 │   ├── polymarket/            Polymarket-specific tooling
 │   │   ├── client.py          SDK wrapper — market discovery, WS subscribe, order placement
@@ -23,7 +23,8 @@ poly_trader/
 │   │   ├── gamma_discovery.py Gamma API market discovery (programmatic)
 │   │   └── run_info.py        Market info query tool (Gamma API CLI)
 │   └── onchain/               On-chain operations
-│       ├── settle.py          Position settlement & redemption
+│       ├── settle_window.py   Auto-settle previous window at new-window start (resolve + redeem)
+│       ├── settle.py          Manual position settlement & redemption
 │       └── check_balance.py   Quick USDC balance check
 ├── analysis/                  Analysis & backtesting
 │   ├── entry_timing.py        Entry timing analysis
@@ -53,20 +54,18 @@ python -m poly_trader check                               # verify credentials
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `POLY_PAIR_COST_MAX` | 1.0 | Max cost for paired order (up_price + down_price) |
-| `POLY_MAX_PER_SIDE` | 20 | Max exposure per side (filled + pending shares) |
+| `POLY_MAX_PER_SIDE` | 20 | Max filled exposure per side; caps hedge size and favorite guard |
 | `POLY_AGGRESSIVENESS` | 0.3 | Maker price = bid + spread × aggressiveness (0-1) |
-| `POLY_MIN_PRICE_GAP` | 0.02 | Min price gap to place another order on same side |
-| `POLY_CANCEL_MIN_AGE` | 120.0 | Min seconds before pending order can be cancelled |
-| `POLY_CANCEL_REPLACE_THRESHOLD` | 0.10 | Absolute price deviation for early cancel of two-leg Pairs |
-| `POLY_CANCEL_MAX_AGE` | 600.0 | Hard force-cancel safety net (seconds) |
+| `POLY_PAIR_COST_TARGET_EXTREME` | 0.99 | Hedge cost guard: skip when heavy avg cost + hedge price > this |
+| `POLY_MIN_ORDER_SIZE` | 5 | Favorite order size (contracts) |
 | `POLY_MIN_REMAINING_TIME` | 180.0 | Stop new orders when < this many seconds left in window |
-| `POLY_MIN_ORDER_SIZE` | 5 | Minimum order size in contracts |
-| `POLY_MAX_IMBALANCE` | 10 | Stop adding to heavy side when filled+pending difference exceeds this |
-| `POLY_MAX_DRAWDOWN` | -5.0 | Session PnL stop (USDC) |
-| `POLY_STOP_ON_WINDOW_LOSS` | true | Skip next window after loss |
-| `POLY_MAX_PRICE_DEV` | 0.20 | Max deviation from 1.0 for pair sum validation |
 | `POLY_MAX_EXTREME_PRICE` | 0.90 | Skip tick if either side's best_bid exceeds this |
 | `POLY_MAX_CONSECUTIVE_FAILURES` | 15 | Stop placing after N consecutive rejected ticks |
-| `POLY_MIN_TICK_INTERVAL` | 1.0 | Min seconds between ticks |
+| `POLY_PRED_CONF_THRESHOLD` | 0.05 | Min \|P_fair − 0.5\| to place a favorite |
+| `POLY_PRED_START_ELAPSED` | 60.0 | Seconds into window before first favorite order |
+| `POLY_PRED_BTC_MAX_AGE` | 8.0 | Skip predictive decisions when cached BTC price older than this |
+| `POLY_FAVORITE_STALE_SECONDS` | 25.0 | Cancel + re-price an unfilled favorite this many seconds old, when the fresh placement is materially better (flipped side / re-bid > +0.005) — prevents an unfilled bid from blocking the whole window |
+| `POLY_HEDGE_PRICE_BOUND` | 0.998 | Bound-hedge price ceiling decided at favorite placement: `max_price = hedge_price_bound − fav_price` |
+| `POLY_POSITIONS_INTERVAL` | 2.0 | CLOB position poll interval (0 disables) — refreshes `auth_inv` |
+| `POLY_MIN_TICK_INTERVAL` | 0.0 | Min seconds between ticks (0 = no throttle, so the bound hedge fires as soon as its favorite fills ≥ 4) |
 | `POLY_WS_RECONNECT_DELAY` | 3.0 | WS reconnect delay on disconnect |

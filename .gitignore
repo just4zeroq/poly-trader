@@ -4,6 +4,9 @@ __pycache__/
 .env
 .env.swp
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 /logs/
 *.log
 .DS_Store

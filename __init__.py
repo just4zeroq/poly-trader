@@ -14,7 +14,6 @@ from .platforms.models import (
     PriceLevel,
     Lot,
     Decision,
-    Pair,
     PendingOrder,
     FillData,
     WindowState,
@@ -28,4 +27,4 @@ from .platforms.models import (
 )
 from .platforms.engine import TradingEngine
 from .platforms.executors import LiveExecutor, OrderExecutor
-from .platforms.strategy import MakerStrategy
+from .platforms.strategy import V4Strategy

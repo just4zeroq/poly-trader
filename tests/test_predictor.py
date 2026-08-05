@@ -57,16 +57,14 @@ def test_favorite_requires_fresh_btc_and_window():
 
 
 def test_config_defaults(monkeypatch):
-    # Hermetic: clear POLY_PREDICTIVE so the default assertion doesn't depend
-    # on the live .env (which sets it true for production runs).
-    monkeypatch.delenv("POLY_PREDICTIVE", raising=False)
-    monkeypatch.delenv("POLY_PRED_REQUIRE_FILLED", raising=False)
+    # Hermetic: clear POLY_POSITIONS_INTERVAL so the default assertion doesn't
+    # depend on a live .env overriding it.
+    monkeypatch.delenv("POLY_POSITIONS_INTERVAL", raising=False)
     cfg = Config()
-    assert cfg.predictive_enabled is False
     assert cfg.pred_conf_threshold == 0.05
     assert cfg.pred_start_elapsed == 60.0
     assert cfg.pred_btc_max_age == 8.0
-    assert cfg.pred_require_filled is True
+    assert cfg.positions_interval == 2.0
 
 
 def test_fair_prob_matches_calibrated_reference():

@@ -3,16 +3,9 @@ Data models for the trading system.
 """
 
 from __future__ import annotations
-import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Optional
-
-
-def _open_gate() -> asyncio.Event:
-    g = asyncio.Event()
-    g.set()
-    return g
 
 
 # ── Market Spec ──
@@ -133,44 +126,11 @@ class Lot:
 @dataclass
 class Decision:
     """Output of strategy.decide() — one order instruction per tick per side."""
-    side: str      # "Up" / "Down"
+    side: str      # "Up" / "Down" (or "Cancel" when cancel_prior is set)
     amount: int    # order size
     price: float   # maker limit price
-    pair_id: str = ""  # links to Pair.pair_id (for order ID tracking in executor)
-    cancel_order_id: str = ""  # if set, cancel this pending order before placing (cancel-replace)
-
-
-@dataclass
-class Pair:
-    """A linked Up+Down pair — created when strategy places a new pair order.
-
-    Both sides use the same qty.  Cost is locked at creation time.
-    """
-    pair_id: str
-    up_price: float
-    down_price: float
-    qty: int = 5
-    up_order_id: str = ""
-    down_order_id: str = ""
-    up_filled: int = 0
-    down_filled: int = 0
-
-    @property
-    def cost(self) -> float:
-        return self.up_price + self.down_price
-
-    @property
-    def is_complete(self) -> bool:
-        return self.up_filled >= self.qty and self.down_filled >= self.qty
-
-    @property
-    def pending_side(self) -> Optional[str]:
-        """Return the side that still needs filling, or None."""
-        if self.up_filled >= self.qty and self.down_filled < self.qty:
-            return "Down"
-        if self.down_filled >= self.qty and self.up_filled < self.qty:
-            return "Up"
-        return None
+    cancel_prior: str = ""  # when set, cancel this pending order instead of placing
+    creates_hedge_plan: bool = False  # favorite orders only — see HedgePlan
 
 
 @dataclass
@@ -185,7 +145,6 @@ class PendingOrder:
     filled: int = 0
     placed_at: float = 0.0
     cancelled_at: float = 0.0  # soft-delete timestamp; > 0 means cancel requested
-    pair_id: str = ""  # links to Pair.pair_id
 
     @property
     def remaining(self) -> int:
@@ -204,6 +163,28 @@ class FillData:
     remaining: int = 0
 
 
+@dataclass
+class HedgePlan:
+    """A hedge bound to a specific favorite order, recorded on place success.
+
+    The plan is created only after the favorite order is successfully placed
+    (executor.place — never at decision time), so it always corresponds to a
+    real live order.  At that point we know: which side to hedge (the opposite
+    leg), the max hedge price (hedge_price_bound − favorite price), and the
+    amount (the full favorite order size).  The hedge is only fired once that
+    favorite order has filled ≥ 4 (round, not truncate — a 4.992 fill counts).
+    ``placed`` is set True the moment the hedge Decision is emitted so the
+    plan is consumed exactly once.
+    """
+    order_id: str        # the favorite order to hedge against
+    side: str            # opposite side to buy ("Up" / "Down")
+    amount: int          # full favorite order size
+    fav_price: float     # favorite order limit price
+    max_price: float     # hedge_price_bound − fav_price
+    filled: float = 0.0  # running fill of the favorite order (float, ≥ 4 fires)
+    placed: bool = False  # True once the hedge Decision is emitted
+
+
 # ── Window State ──
 
 
@@ -214,33 +195,19 @@ class WindowState:
     start_time: float = 0.0
     window_num: int = 0
     inventory: dict = field(default_factory=lambda: {"Up": 0, "Down": 0})
+    auth_inv: dict = field(default_factory=lambda: {"Up": 0, "Down": 0})
+    """Authoritative positions — WS fills write-through optimistically, the
+    background _position_loop overwrites with CLOB truth every
+    positions_interval.  The strategy gates ONLY on this value."""
     cost: dict = field(default_factory=lambda: {"Up": 0.0, "Down": 0.0})
     total_spent: float = 0.0
     trades: int = 0
     pending_orders: dict[str, PendingOrder] = field(default_factory=dict)
     lots: list = field(default_factory=list)  # list[Lot] — cost records only
-    pairs: list = field(default_factory=list)  # list[Pair] — active pairs for this window
-    accumulate: int = 0  # step3 cumulative placed qty (shared room for Up+Down)
-    reconcile_gate: asyncio.Event = field(default_factory=lambda: _open_gate())
     last_activity: float = field(default_factory=time.time)
-
-    @property
-    def paired_up(self) -> int:
-        """Total Up contracts committed across all Pairs."""
-        return sum(p.up_filled for p in self.pairs)
-
-    @property
-    def paired_down(self) -> int:
-        """Total Down contracts committed across all Pairs."""
-        return sum(p.down_filled for p in self.pairs)
-
-    @property
-    def unpaired_up(self) -> int:
-        return self.inventory["Up"] - self.paired_up
-
-    @property
-    def unpaired_down(self) -> int:
-        return self.inventory["Down"] - self.paired_down
+    hedge_plan: Optional[HedgePlan] = None
+    """Bound hedge for the current favorite order, set when the favorite is
+    placed and consumed (placed=True) when the hedge Decision is emitted."""
 
     @property
     def avg_cost_up(self) -> float:

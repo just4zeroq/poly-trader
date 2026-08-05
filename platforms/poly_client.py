@@ -15,14 +15,10 @@ import time
 import traceback
 from typing import Optional
 
+from polymarket.auth import BuilderApiKey
 from polymarket.clients.async_public import AsyncPublicClient
 from polymarket.clients.async_secure import AsyncSecureClient
-from polymarket.models.clob.market_events import (
-    MarketBestBidAskEvent,
-    MarketBestBidAskPayload,
-    MarketLastTradePriceEvent,
-    MarketLastTradePricePayload,
-)
+from polymarket.models.clob.market_events import MarketBestBidAskEvent
 from polymarket.models.clob.order_book import OrderBook
 from polymarket.models.clob.order_response import AcceptedOrder, OrderResponse, RejectedOrder
 from polymarket.models.clob.orders import SignedOrder
@@ -86,8 +82,20 @@ class SdkClient:
         """
         if not cfg.has_credentials:
             return
+        # Pass the API key triplet as a Builder key so gasless redemption
+        # (settlement) works — redeem_positions needs a relayer api_key,
+        # otherwise it errors with "Gasless transactions require a Builder
+        # API Key or Relayer API Key".
+        api_key = None
+        if cfg.api_key and cfg.api_secret and cfg.api_passphrase:
+            api_key = BuilderApiKey(
+                key=cfg.api_key,
+                secret=cfg.api_secret,
+                passphrase=cfg.api_passphrase,
+            )
         self._secure = await AsyncSecureClient.create(
             private_key=cfg.private_key,
+            api_key=api_key,
         )
         logger.info("Secure client created (wallet=%s)", self._secure._ctx.wallet)
 
@@ -341,11 +349,15 @@ class SdkClient:
                 for order in page.items:
                     oid = order.id
                     tid = str(order.token_id)
-                    remaining = int(order.original_size - order.size_matched)
-                    if remaining <= 0:
-                        continue
                     side = "Up" if tid == up_tid else ("Down" if tid == down_tid else None)
                     if side is None:
+                        continue
+                    # Skip fully-filled orders (a 5-contract maker fill reports
+                    # size_matched=4.992 → remaining rounds to 0): they can no
+                    # longer move the position.  Restart recovery needs no
+                    # order archaeology — the generic imbalance hedge re-derives
+                    # everything from CLOB positions + avg_cost.
+                    if int(round(order.size_matched)) >= int(order.original_size):
                         continue
                     pending[oid] = PendingOrder(
                         order_id=oid,
@@ -354,7 +366,7 @@ class SdkClient:
                         buy_sell="BUY",
                         price=float(order.price),
                         amount=int(order.original_size),
-                        filled=int(order.size_matched),
+                        filled=int(round(order.size_matched)),
                         placed_at=order.created_at.timestamp() if order.created_at else 0,
                     )
 
@@ -367,7 +379,10 @@ class SdkClient:
                     tid = str(pos.token_id)
                     if tid not in (up_tid, down_tid):
                         continue
-                    sz = int(pos.size) if pos.size else 0
+                    # Round, not truncate: a 5-contract maker fill reports as
+                    # 4.9992 (fee artifact); int() would lose the last contract
+                    # and freeze reconcile on a phantom pending order.
+                    sz = int(round(pos.size)) if pos.size else 0
                     if sz <= 0:
                         continue
                     if tid == up_tid:
@@ -655,7 +670,10 @@ class SdkClient:
             return None
         try:
             order = await self._secure.get_order(order_id=order_id)
-            return int(order.size_matched) if order else None
+            # Round, not truncate: size_matched reports 4.9992 for a 5-contract
+            # maker fill; int() would lose the last contract and break fill
+            # resolution for the bound hedge.
+            return int(round(order.size_matched)) if order else None
         except Exception as e:
             logger.debug("get_order(%s…) failed: %s", order_id[:12], e)
             return None
@@ -673,7 +691,7 @@ class SdkClient:
                     if not pos.token_id:
                         continue
                     tid = str(pos.token_id)
-                    sz = int(pos.size) if pos.size else 0
+                    sz = int(round(pos.size)) if pos.size else 0
                     if tid == up_tid:
                         result["Up"] = sz
                     elif tid == down_tid:
