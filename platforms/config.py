@@ -97,11 +97,19 @@ class Config:
     """Seconds into the window before the first favorite order."""
     pred_btc_max_age: float = field(default_factory=lambda: _env_float("pred_btc_max_age", 8.0))
     """Skip predictive decisions when the cached BTC price is older than this."""
-    favorite_stale_seconds: float = field(default_factory=lambda: _env_float("favorite_stale_seconds", 25.0))
-    """A favorite order left unfilled for this many seconds is cancelled and
-    re-priced against the fresh model fair.  Without this a stale low-ball
-    favorite blocks the whole window via the anti-stack gate (one shot per
-    window that never fills = an idle window)."""
+    favorite_stale_seconds: float = field(default_factory=lambda: _env_float("favorite_stale_seconds", 120.0))
+    """A favorite order left unfilled (filled < min_order_size − 1) for this
+    many seconds AND priced out by more than stale_price_diff is cancelled and
+    re-priced against the fresh book.  Without this a stale low-ball favorite
+    blocks the whole window via the pending gate (an order with filled <
+    min_order_size − 1 blocks all new orders; one that never fills = an idle
+    window)."""
+    stale_price_diff: float = field(default_factory=lambda: _env_float("stale_price_diff", 0.10))
+    """Churn guard for stale-cancel: a resting favorite is cancelled only when
+    the current maker price has moved more than this ABOVE its limit — a bid
+    the market ran past will not fill.  A bid still at/near its limit (or
+    below) can still fill, so cancelling it would just churn (cancel →
+    re-place at nearly the same price)."""
 
     # ── Position reconciliation ──
     positions_interval: float = field(default_factory=lambda: _env_float("positions_interval", 2.0))

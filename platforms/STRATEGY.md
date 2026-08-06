@@ -12,14 +12,18 @@
 ```
 每 tick（V4Strategy.decide）:
   1. elapsed < pred_start_elapsed (60s) → []      # 窗口开始 60s 内任何腿都不下单
-  2. 绑定对冲已就绪（favorite 成交 ≥ 4）→ **失衡 ≤ min_order_size + 1 时**在 ≤ 上界处对冲指定先行腿
-       - HedgePlan 在 favorite 下单成功时记录：对侧、整单量、max_price = hedge_price_bound − fav_price
-       - favorite filled ≥ 4 才触发（round 不 truncate，4.992 算数）
-       - light maker 价 > bound → 等待重试，不追价
-       - **失衡 > min_order_size + 1（残量并入、跨多轮均价）→ 弃计划，走通用对冲（混均守卫）**
+  2. 存在 pending（filled < min_order_size − 1）→ 只处理 stale-cancel，不下任何单  # 防堆叠总闸
+       - pending = 未撤单且 filled < min − 1；**满单才补腿**（部分成交在填满前不触发对冲）
+       - 只撤「先行脚」：超 favorite_stale_seconds(120s) 且 当前 maker 价 > 挂单价 + stale_price_diff(0.10)
+         （被市场甩开的 bid 才撤；价没动或跌到 bid 下方说明可能成交，不撤——避免 cancel→同价重挂的空转）
+       - 对冲脚永不撤
+  3. 绑定对冲（有活跃未消费计划时）：取实时失衡 amount = auth_inv[heavy] − auth_inv[light]
+       - **min ≤ amount ≤ min_order_size + 1 → 绑定对冲**：在 ≤ 上界处对冲指定先行腿
+         (max_price = hedge_price_bound − fav_price，favorite 下单时定死；light maker 价 > bound → 等待重试，不追价)
+       - **amount > min_order_size + 1（残量并入、跨多轮均价）→ 弃计划，走通用对冲（混均守卫）**
+       - **amount < min（部分成交残量）→ 弃计划，残量并入下一轮 favorite**
        - 不受最后 3 分钟限制，监控到窗口结束
-  3. auth_inv[Up] != auth_inv[Down]（无绑定计划时）→ 补平 light 边
-       - 有绑定计划但 favorite 未成交 ≥ 4 时，通用补腿不碰部分成交
+  4. auth_inv 失衡（无绑定计划时）→ 补平 light 边
        - **失衡 ≤ min_order_size + 1 → 绑定式合成对冲**：max_price = hedge_price_bound − avg_cost_heavy
          （以均成本为锚；重启/计划已消费时等价于计划上界）
        - **失衡 > min_order_size + 1 → 通用对冲**，成本守卫:
@@ -28,10 +32,8 @@
          残量并入下一轮（累计后由一次 ≥ min 的对冲锁平）
        - 补腿量 = |imbalance|，受 max_per_side 剩余 room 封顶
        - 不受最后 3 分钟限制，监控到窗口结束
-  4. remaining < min_remaining_time (180s) → []  # 最后 3 分钟不下新 favorite
-  5. auth_inv 持平 + 有活跃 pending → []           # 防堆叠（顺带撤过期的死 favorite）
+  5. remaining < min_remaining_time (180s) → []  # 最后 3 分钟不下新 favorite
   6. auth_inv 持平 + 模型够自信 → Decision(fav, min_order_size, maker价)
-       - 反堆叠: 已有待对冲的先行腿（活跃未消费计划）→ 不再下 favorite
        - |P_fair − 0.5| ≥ pred_conf_threshold   # 模型只定方向，不干预价格
        - 暴露守卫: auth_inv[side] >= max_per_side → []
        - 价格上限: price > max_extreme_price (0.90) → []   # 不追高价
@@ -40,7 +42,7 @@
 
 对冲腿与指定先行腿订单绑定（`HedgePlan`）：
 - **何时记录**：favorite 订单**下单成功时**（`executor.place`）才记录计划——对侧、`max_price = hedge_price_bound − fav_price`（默认 0.998 − fav_price），并绑定该 favorite 的 order_id。**决策时刻不记录**：计划永不先于真实订单存在，SDK 下单失败则无计划。
-- **何时触发**：只有该 favorite 单成交 **≥ 4**（round，非 truncate——4.992 计为 5）才触发，防止部分成交过早对冲。
+- **何时触发**：**满单才补腿**——pending 门控（filled < min − 1 挡住所有单）放行后，按实时失衡路由：amount ∈ [min, min_order_size + 1] → 绑定对冲（plan.filled 已不参与门控，仅信息用）；amount < min → 弃计划、残量并入下一轮。
 - **路由**：失衡 ≤ min_order_size + 1 → 绑定对冲；> min_order_size + 1（残量并入、跨多轮均价）→ 弃计划，
   走通用混均守卫——此时计划上界锚定的 fav_price 已不是 heavy 边真实均价。
 - **下多少**：**实时失衡** `auth_inv[heavy] − auth_inv[light]`（非计划的整单量）——子最小残量并入下一轮后会在 heavy 边累积，只有当前失衡才能一次锁平；普通 favorite 即等于计划量。受 max_per_side room 封顶。
@@ -73,30 +75,93 @@ favorite 补腿几乎必然过不了成本守卫，本质是裸仓赌单，故�
 
 补腿过贵 → 保持裸仓，每 tick 重试（成本守卫日志可见），light 边变便宜后自动锁仓。
 
-### 下单总量约束
+### 下单总量与约束（必不可少）
+
+每 tick 的下单量被以下守卫层层收口，**总量锁死，不会超买/超卖**：
 
 | 约束 | 值 | 作用 |
 |------|-----|------|
-| `min_order_size` (5) | 每轮 favorite 下单张数 | 单次开仓量 |
-| `max_per_side` (100) | 每边已成交持仓上限 | 补腿量封顶 + favorite 暴露守卫 |
-| 补腿 room 封顶 | `max_per_side − auth_inv[light]` | 超仓时补腿不超 room |
-| `pred_conf_threshold` (0.05) | 最小 |P_fair−0.5| | 不自信不下单 |
-| 防堆叠 | auth_inv 持平时有活跃 pending → 不下单 | 同一时间至多 1 个在途单 |
+| `min_order_size`（默认 5） | favorite 单次下单张数 | 开仓单位；部分成交残量（< min）并入下一轮 |
+| `max_per_side`（= `POLY_MAX_PER_SIDE`） | 每边已成交持仓上限 | ① favorite 暴露守卫：`auth_inv[side] >= max_per_side` → 不下新 favorite；② 补腿量封顶：`min(amount, room)` |
+| 补腿 room 封顶 | `max_per_side − auth_inv[light]` | 补腿绝不超 max_per_side，超仓时只补到 room |
+| 防堆叠（pending 门控） | 任一订单 `filled < min_order_size − 1` → 不下任何单 | 同一时间至多 1 个在途单；**满单才补腿** |
+| 补腿量 = 实时失衡 | `auth_inv[heavy] − auth_inv[light]` | 非计划的整单量——残量并入后一次锁平 |
+| 失衡路由 | \|diff\| < min → 并入下一轮；∈[min, min+1] → 绑定对冲；> min+1 → 通用对冲 | 子最小量不下单，保证补腿量恒 ≥ min |
+| `pred_conf_threshold`（0.05） | 最小 \|P_fair−0.5\| | 不自信不下单 |
+| `max_extreme_price`（0.90） | favorite 价格上限 | 临近结算不追高价 |
+| `pair_cost_target_extreme`（0.99） | 补腿成本守卫 | heavy 均成本 + 补腿后 light 混均超过则跳过 |
 
-### 对账
+**应用顺序**（`decide()` 每 tick）：
+1. **防堆叠闸门最先**：存在 pending（filled < min − 1）→ 只能撤单，任何下单路径都不进
+2. **补腿先于 favorite**：失衡 ≥ min 先补平（room 封顶），单单位走绑定/合成绑定，累计走通用
+3. **favorite 最后**：模型方向 + `min_order_size` 量 + maker 价，过暴露/价格/自信守卫才下单
 
-- WS fill 写穿 `ws.auth_inv`（乐观）
-- `_position_loop` 每 `positions_interval` (2s) 轮询 CLOB positions，**单调向上合并**：
-  `auth_inv` / `inventory` 只向 CLOB 数字上移，**永不抹掉已记录持仓**（data-api 最终一致，
-  过期快照可能返回更小的值；抹掉会导致误判空仓 → 反向再下一腿，配对成本 > $1）
-- CLOB 显示多于 WS 记录（丢 fill 事件）时，差额**吸收进该边活跃 pending 单**（按 limit 价记成本），
-  inventory / auth_inv / pending 三者收敛 —— 幽灵 pending 不再卡死 anti-stack，日志与页面一致
-- **重启恢复**（无对冲计划重建）：`load_current_state` 从 CLOB 恢复持仓 + 均价 + 在途单（只留未满单，
-  满单/已撤单丢弃），`auth_inv` = 持仓。HedgePlan 只存内存，重启即丢失——不做重建，按失衡量路由：
-  单单位失衡（≤ min_order_size + 1）走**合成绑定对冲**（`max_price = hedge_price_bound − avg_cost_heavy`，
-  均成本即单笔 favorite 的实际成本，与计划上界等价）；累计失衡（> min_order_size + 1）走**通用对冲**
-  （混均成本守卫，比绑定上界更紧 ~0.008）。第一个 tick 即响应，与不重启时窗口中途的恢复路径一致。
-  满单 favorite（imbalance = 全量）一次补平，部分成交的 favorite 分步补，终点同样双边锁平。
+### 对账（Reconciliation）
+
+分层：**WS fill 乐观写穿（快路径）+ 后台 CLOB 轮询校正（权威）+ 在途单对账（防幽灵）**。策略门控只用 `auth_inv`。
+
+**1. WS fill 写穿（`executor._process_fill`，快路径）**
+- UserTradeEvent → `_handle_trade`：`_fill_seen` 按累计匹配量去重（历史 replay 跳过）；歧义事件（matched ≤ 已见累计）每订单每 10s 查一次 CLOB `get_order_filled` 定夺，只有 CLOB 累计更多才补增量
+- 成交先于下单到达 → 进 orphan buffer，`place()` 注册订单后回补
+- `_process_fill` 直接把成交写进 `ws.inventory` + **`ws.auth_inv`**（策略门控值）+ cost / total_spent / lots；成交同步到 `hedge_plan.filled`
+
+**2. CLOB 持仓轮询（`_poll_positions`，每 `positions_interval`=2s，权威）**
+- 从 CLOB `get_positions` 拉两腿持仓，**单调向上合并**：`auth_inv` / `inventory` 只向 CLOB 数字上移，**永不抹掉已记录持仓**（data-api 最终一致，过期快照可能返回更小的值；抹掉会误判空仓 → 反向再下一腿，配对成本 > $1）
+- **fill_seq 守卫**：轮询快照在途时 WS 写穿了新成交（`fill_seq` 变化）→ 跳过差额归因（避免重复记账），但仍允许 auth_inv 向上收敛
+- **丢 fill 吸收**：CLOB 显示多于 WS 记录时，差额**按该边活跃 pending 单的 limit 价记成本**，inventory / auth_inv / pending 三者收敛——幽灵 pending 不再卡死 anti-stack，日志与页面一致；归因的成交同样同步到 `hedge_plan.filled`（否则丢 WS 事件会永久卡住绑定对冲）
+
+**3. 在途单对账（`_reconcile_orders`，每 2s，CLOB open book 为权威）**
+- 只处理当前窗口订单；查询失败（None）是 **no-op**——绝不当成「无订单」
+- **已成交幽灵（remaining ≤ 0）**：CLOB 已无此单 → 从 pending 字典删除（纯清理）
+- **未成交却不在 CLOB 的幽灵**：可能成交尚未落 positions，先**连续缺席 2 次轮询**才软关闭（`cancelled_at = now`），给 `_poll_positions` 吸收 fill 留出窗口；否则它会靠 `_has_active_pending` 卡死整个窗口
+- 订单离开 CLOB open book 即视为已不在市，不再参与任何门控
+
+**4. 重启恢复（`load_current_state`，窗口中途重启）**
+- 从 CLOB 恢复持仓 + 均价 + 在途单（只留未满单，满单/已撤单丢弃），`auth_inv` = 持仓
+- HedgePlan 只存内存，重启即丢失——不做重建，按失衡量路由：单单位失衡（≤ min_order_size + 1）走**合成绑定对冲**（`max_price = hedge_price_bound − avg_cost_heavy`，均成本即单笔 favorite 的实际成本，与计划上界等价）；累计失衡（> min_order_size + 1）走**通用对冲**（混均成本守卫，比绑定上界更紧 ~0.008）
+- 第一个 tick 即响应，终点双边锁平（满单 favorite 一次补平，部分成交分步补）
+
+### 下单（Order Placement）
+
+```
+strategy.decide() → Decision[]（0/1 单 + 可选 Cancel 指令）
+    ↓
+engine._place_decisions() 逐条处理
+    ├─ Cancel 指令（d.cancel_prior）→ executor.cancel() 撤单（不计入下单成功）
+    └─ 订单 → _place_order() → executor.place()
+            → SDK place_limit_order()（maker 价，post_only）
+            → 成功：PendingOrder 入 ws.pending_orders；is_favorite 记录 HedgePlan
+                     emit order_placed → 检查 orphan fill 回补
+            → 失败：emit order_failed，返回 None，不产生计划
+```
+
+- **HedgePlan 只在 favorite 下单成功时记录**（`executor.place`，绝不在决策时刻）——计划永不先于真实订单存在，SDK 下单失败则无计划。对侧、`max_price = hedge_price_bound − fav_price`、全单量，全部从订单本身推导，无需跨 tick 携带
+- **取消指令不算下单**：`_place_decisions` 的 `any_ok` 只统计真实下单成功；连续失败计数器（余额耗尽检测）不受撤单影响，且撤单 tick 不计入失败
+- **每 tick 至多 1 个在途单**：pending 门控保证同一时间只有一个未满单；绑定/通用对冲再次下单前会检查同边活跃 pending（`_place_bound_hedge` / `_place_hedge`），不会叠单
+- favorite 决策带 `creates_hedge_plan=True` 标记，只有它会触发计划生成
+
+### 撤单（Cancellation）
+
+**1. 主动撤单——stale-cancel 重挂（`_reprice_stale_favorites`）**
+
+favorite 挂单久不成交会靠 pending 门控卡死整窗，**满足全部**条件才撤（下一 tick 按当前 book 重挂）：
+- **只撤先行脚（favorite）**：对冲脚（`hedge_sides` = 失衡轻边 ∪ 已消费计划的侧）**永不撤**——撤了会扔掉已承诺的绑定对冲，让成交合约裸奔
+- 该单仍处 pending：`filled < min_order_size − 1`（≥ min−1 会路由/并残量，不是阻塞）
+- `age > favorite_stale_seconds`（120s）：停留太久
+- **被市场甩开**：当前 maker 价 > 挂单价 + `stale_price_diff`（0.10）——只剩买不进的 bid 才撤；价没动/跌到 bid 下方说明可能成交，撤了就是 cancel → 同价重挂的空转
+
+撤单指令经 `_place_decisions` 走 `executor.cancel`，`any_ok` 不计、失败计数器不计。
+
+**2. 窗口结束 `cancel_all`（`_settle_window`）**
+- 软撤所有 pending → 等 0.3s 让在途 fill 到达 → `flush_cancelled(grace=0)` 清掉；撤单失败的仍在 CLOB 上，记警告
+- 清空 `pending_orders` + `hedge_plan`（绑定对冲随窗口死亡）
+
+**3. 幽灵单关闭（`_reconcile_orders`）**
+- 我方记着、CLOB open book 却没有的未满单：**连续缺席 2 次轮询** → 软关闭（`cancelled_at = now`）——可能是被外部撤掉或丢响应，不关会永久卡 anti-stack
+
+**4. 软删除机制**
+- `executor.cancel` 成功 → `po.cancelled_at = time.time()`（软删除，保留记录供对账）；`flush_cancelled(grace=5s)` 到期才从字典移除
+- `_has_active_pending` 只认 `cancelled_at == 0` 的在途单——软删订单立即解除门控
 
 ### 结算
 
@@ -117,22 +182,34 @@ python3 poly_trader/tools/onchain/settle_window.py [--slug …] [--interval 5] [
 ### 订单生命周期
 
 ```
-strategy.decide() → Decision[]
+strategy.decide() → Decision[]（0/1 单 + 可选 Cancel 指令）
     ↓
-engine._place_decisions() → 逐单 _place_order()
+engine._place_decisions() 逐条处理
+    ├─ Cancel 指令 → executor.cancel()（软删除：cancelled_at 打戳）
+    └─ 订单 → _place_order() → executor.place()
+            → SDK place_limit_order()（maker 价，post_only）
+            → 成功：PendingOrder 入 ws.pending_orders
+               favorite → 记录 HedgePlan（max_price = bound − fav_price）
+            → 失败：order_failed，不产生计划
     ↓
-executor.place() → SDK place_limit_order() → PendingOrder 入 ws.pending_orders
+UserTradeEvent → _handle_trade()（_fill_seen 去重 / orphan 缓冲 / 歧义 CLOB 定夺）
+            → _process_fill() 写穿 ws.inventory/auth_inv/cost，满单删 pending
     ↓
-UserTradeEvent → _handle_trade() → 更新 ws.inventory/auth_inv/cost，满单删 pending
+_position_loop() 每 2s（后台，与 tick 循环并行）：
+    _poll_positions()    CLOB positions 单调向上校正 auth_inv/inventory
+                         （fill_seq 守卫；丢 fill 按 limit 价吸收进 pending）
+    _reconcile_orders()  CLOB open book 对账在途单（幽灵连续 2 次轮询关闭）
     ↓
-_position_loop() 每 2s 以 CLOB positions 校正 auth_inv
+窗口结束 → _settle_window()：cancel_all → 清 pending/hedge_plan → WindowEnd
+    ↓
+下一窗口开始 → tools/onchain/settle_window.py 解析获胜方 + 赎回（见「结算」）
 ```
 
 ### 环境变量（实际使用）
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `POLY_MAX_PER_SIDE` | 20 | 每边已成交持仓上限 |
+| `POLY_MAX_PER_SIDE` | —（.env 配置） | 每边已成交持仓上限（当前实盘 .env 设为 100，按需调整） |
 | `POLY_AGGRESSIVENESS` | 0.3 | 做市价 = bid + spread × aggr，越高越激进 |
 | `POLY_MIN_ORDER_SIZE` | 5 | favorite 单次下单张数 |
 | `POLY_MAX_EXTREME_PRICE` | 0.90 | 单边 best_bid 超过此值视为已settled，跳过 tick；也是 favorite 价格上限（> 此值不追）|
@@ -142,7 +219,8 @@ _position_loop() 每 2s 以 CLOB positions 校正 auth_inv
 | `POLY_PRED_CONF_THRESHOLD` | 0.05 | 最小 |P_fair−0.5| |
 | `POLY_PRED_START_ELAPSED` | 60s | 窗口开始多久后可下 favorite |
 | `POLY_PRED_BTC_MAX_AGE` | 8s | BTC 缓存价超过此年龄则跳过预测决策 |
-| `POLY_FAVORITE_STALE_SECONDS` | 25s | 未成交 favorite 停留超过此秒数 → 撤单重报（仅当新 placement 明显更优：换边 / 重报价 +0.005）；防止一单死单占住整个窗口 |
+| `POLY_FAVORITE_STALE_SECONDS` | 120s | pending 先行脚（filled < min_order_size − 1）停留超过此秒数且被市场甩开 → **主动撤单**（只撤先行脚，对冲脚永不撤），下一 tick 按当前 book 重报；防止死单占住整个窗口 |
+| `POLY_STALE_PRICE_DIFF` | 0.10 | stale-cancel 防空转：当前 maker 价需 > 挂单价 + 此值才撤（被市场甩开的 bid 才撤；价没动/跌到 bid 下方说明可能成交，不撤） |
 | `POLY_HEDGE_PRICE_BOUND` | 0.998 | 绑定对冲价格上界：`max_price = hedge_price_bound − fav_price`，favorite 下单时定死 |
 | `POLY_POSITIONS_INTERVAL` | 2s | 后台 CLOB 持仓轮询间隔（0 关闭） |
 | `POLY_WS_RECONNECT_DELAY` | 3s | WS 重连延迟 |

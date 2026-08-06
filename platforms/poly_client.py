@@ -174,16 +174,10 @@ class SdkClient:
         if no_price is not None and float(no_price) >= 0.99:
             return "Down"
 
-        # Market closed but prices not yet at extremes — use which is higher
-        if market.state and market.state.closed:
-            if yes_price is not None and no_price is not None:
-                yp = float(yes_price)
-                np = float(no_price)
-                if yp > np:
-                    return "Up"
-                elif np > yp:
-                    return "Down"
-
+        # Not yet resolved to an extreme — return None and let the caller
+        # poll again.  Guessing the winner from which price is higher at
+        # close is a coin flip near 0.5/0.5 and can fire a redeem before the
+        # on-chain resolution is final, leaving the window unsettled.
         return None
 
     async def find_market_for_spec(self, spec: MarketSpec) -> Optional[MarketInfo]:
@@ -699,6 +693,27 @@ class SdkClient:
         except Exception as e:
             logger.warning("get_positions failed: %s", e)
         return result
+
+    async def get_open_orders_for_market(self, condition_id: str) -> Optional[list]:
+        """Return live CLOB orders for a market, or None on failure.
+
+        Each element is a raw SDK Order (.id, .token_id, .price,
+        .original_size, .size_matched, .created_at).
+
+        Returns None (NOT []) on failure — a query error must not be read as
+        "no open orders", which would purge every tracked pending order.
+        """
+        if not self._secure:
+            return None
+        try:
+            paginator = self._secure.list_open_orders(market=condition_id)
+            orders = []
+            async for page in paginator:
+                orders.extend(page.items)
+            return orders
+        except Exception as e:
+            logger.warning("get_open_orders_for_market failed: %s", e)
+            return None
 
     async def get_trade_history(
         self, condition_id: str, user_address: str,

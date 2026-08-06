@@ -71,10 +71,16 @@ class PriceCache:
     def __init__(self):
         self._data: dict[str, OrderBookSnapshot] = {}
         self._event = asyncio.Event()
+        # Update generation + last-consumed marker.  Bumped on every
+        # update/wake so wait_update() can tell whether an update landed
+        # while it was clearing/waiting and react immediately instead of
+        # sleeping the full timeout (the lost-wakeup bug).
+        self._generation = 0
+        self._consumed = 0
 
     def update(self, token_id: str, snap: OrderBookSnapshot):
         self._data[token_id] = snap
-        self._event.set()
+        self._bump()
 
     def update_from_ws(self, token_id: str, best_bid: float, best_ask: float,
                        bid_size: float = 0.0, ask_size: float = 0.0):
@@ -93,18 +99,34 @@ class PriceCache:
 
     def wake(self):
         """Wake up any task blocked in ``wait_update()`` immediately."""
+        self._bump()
+
+    def _bump(self):
+        self._generation += 1
         self._event.set()
 
     async def wait_update(self, timeout: float = 5.0):
-        """Wait for next price update or *timeout* seconds, whichever comes first.
+        """Wait for the next price update or *timeout* seconds, whichever first.
 
-        The caller should re-read prices from ``get()`` after this returns.
+        The caller re-reads prices from ``get()`` after this returns.  The
+        generation checks close the lost-wakeup race: an update that lands
+        while the previous tick was still processing, or in the gap between
+        ``clear()`` and the event ``wait()``, moves the generation — and this
+        returns immediately instead of sleeping the full timeout.
         """
+        gen = self._generation
+        if gen != self._consumed:
+            self._consumed = gen
+            return  # update arrived while the previous tick was running
         self._event.clear()
+        if self._generation != gen:
+            self._consumed = self._generation
+            return  # update landed in the clear→wait gap — don't sleep
         try:
             await asyncio.wait_for(self._event.wait(), timeout)
         except asyncio.TimeoutError:
             pass
+        self._consumed = self._generation
 
 
 # ============================================================
@@ -339,6 +361,20 @@ class TradingEngine:
 
         # Tick throttling
         self._last_tick_time: float = 0.0
+
+        # In-flight order reconciliation (every positions_interval).
+        # oid → consecutive polls the order was missing from the CLOB open
+        # book.  A drop can be a real fill whose positions snapshot hasn't
+        # caught up yet, so a ghost is only closed after it has been absent
+        # for this many consecutive polls.  See _reconcile_orders.
+        self._ghost_polls: dict[str, int] = {}
+        self._ghost_polls_threshold = 2
+
+        # Window-scoped feature-loader task.  A bare asyncio.create_task holds
+        # only a weak ref in the loop; without this strong reference the task
+        # can be garbage-collected mid-await ("Task was destroyed but it is
+        # pending"), silently disabling favorites for that window.
+        self._window_task: Optional[asyncio.Task] = None
 
         # Event system
         self._event_handlers: dict[str, list[Callable]] = {}
@@ -589,7 +625,7 @@ class TradingEngine:
             down_token_id=market.down_token_id,
         ))
 
-        asyncio.create_task(self._load_window_features(market))
+        self._window_task = asyncio.create_task(self._load_window_features(market))
 
         # ── Restore current positions (engine restart mid-window) ──
         state = await self.sdk.load_current_state(market)
@@ -710,7 +746,14 @@ class TradingEngine:
                                   t_emitted, t_placed, decisions, ws_state)
 
             # ── Consecutive failure → idle (likely out of balance) ──
-            if decisions:
+            # Only actual placement attempts move the counter.  A tick whose
+            # decisions are pure cancel directives (re-pricing a stale
+            # favorite) neither resets nor increments it: a failed cancel is
+            # not a placement rejection, and a successful cancel is not
+            # evidence of balance — counting either would skew the shutdown
+            # decision toward a spurious idle.
+            placed = [d for d in decisions if not d.cancel_prior]
+            if placed:
                 if tick_any_ok:
                     consecutive_failures = 0
                 else:
@@ -830,7 +873,14 @@ class TradingEngine:
                 break
             if ws is None or market is None:
                 continue
-            await self._poll_positions(ws, market)
+            try:
+                await self._poll_positions(ws, market)
+                await self._reconcile_orders(ws, market)
+            except Exception as e:
+                # This task runs as a TaskGroup child — an uncaught exception
+                # would cancel every engine task.  A malformed SDK field or a
+                # transient API shape change must not kill the bot.
+                logger.warning("  [reconcile] position/order poll error: %s", e)
 
     async def _poll_positions(self, ws: WindowState, market: MarketInfo) -> bool:
         """One CLOB position poll; reconcile auth_inv + inventory upward.
@@ -899,6 +949,81 @@ class TradingEngine:
             logger.info("  [position] pos=%s ws=%s", positions, ws.inventory)
         return changed
 
+    async def _reconcile_orders(self, ws: WindowState, market: MarketInfo) -> bool:
+        """Reconcile in-flight orders (pending_orders) against the CLOB open book.
+
+        The CLOB is the authority on which orders are actually live.  Scope is
+        the current window only — late fills / orders from other windows are
+        left alone (cross-window is handled elsewhere).
+
+        PURGE direction — orders we track that CLOB no longer lists:
+          * A filled phantom (remaining <= 0) is just cosmetically stale;
+            drop it from the dict immediately.
+          * An unfilled order absent from CLOB is a ghost — cancelled out from
+            under us (lost cancel response, manual cancel elsewhere).  Left in
+            pending it blocks ``_has_active_pending`` → anti-stack → favorites
+            for the entire window.  It is closed only after it has been
+            missing for ``_ghost_polls_threshold`` consecutive polls: a real
+            fill leaves the open book an instant before its position lands in
+            the (eventually-consistent) positions API, and that window lets
+            ``_poll_positions`` absorb the fill into the order instead.
+
+        Returns True if pending_orders changed.  A query failure (None) is a
+        no-op — never treat an API error as "no orders".
+        """
+        orders = await self.sdk.get_open_orders_for_market(market.condition_id)
+        if orders is None:
+            return False
+
+        up_tid = market.up_token_id
+        down_tid = market.down_token_id
+        live: set[str] = set()
+        for order in orders:
+            tid = str(order.token_id)
+            if tid not in (up_tid, down_tid):
+                continue  # not our tokens
+            # A fully-filled order can no longer move the position (a
+            # 5-contract maker fill reports size_matched=4.992 → rounds to 5).
+            # Same skip as load_current_state — no order archaeology.
+            if int(round(order.size_matched)) >= int(order.original_size):
+                continue
+            live.add(order.id)
+
+        changed = False
+        for oid, po in list(ws.pending_orders.items()):
+            if po.cancelled_at != 0 or oid in live:
+                self._ghost_polls.pop(oid, None)  # closed or still live — not a ghost
+                continue
+            if po.remaining <= 0:
+                del ws.pending_orders[oid]  # filled phantom — cosmetic cleanup
+                self._ghost_polls.pop(oid, None)
+                logger.info(
+                    "  [reconcile] %s (filled %d/%d) gone from CLOB → purged",
+                    oid[:12], po.filled, po.amount)
+                changed = True
+                continue
+            # Missing from CLOB but not filled on our books.  First observation
+            # may be a fill whose position hasn't landed yet — hold for
+            # consecutive polls before declaring it a ghost.
+            n = self._ghost_polls.get(oid, 0) + 1
+            if n < self._ghost_polls_threshold:
+                self._ghost_polls[oid] = n
+                continue
+            self._ghost_polls.pop(oid, None)
+            po.cancelled_at = time.time()
+            logger.warning(
+                "  [reconcile] ghost %s (%s %d @ %.4f) absent from CLOB %d polls → closed",
+                oid[:12], po.side, po.remaining, po.price, n)
+            changed = True
+
+        # Drop counters for orders that left pending by another path (a fill
+        # that purged the entry, or settlement clearing the window).
+        for oid in list(self._ghost_polls):
+            if oid not in ws.pending_orders:
+                del self._ghost_polls[oid]
+
+        return changed
+
 
     # ── Order execution ──
 
@@ -912,15 +1037,21 @@ class TradingEngine:
 
     async def _place_decisions(self, market: MarketInfo, ws: WindowState,
                                decisions: list[Decision]) -> bool:
-        """Place a batch of single-leg orders (one per side). Returns True if any placed."""
+        """Place a batch of single-leg orders (one per side).
+
+        Returns True if any ORDER was placed.  Cancel directives (re-pricing
+        a stale favorite) are handled here but never count toward the return:
+        the caller uses it to reset/increment the consecutive-placement-
+        failure counter, and a cancel — success or failure — is not evidence
+        about the account balance.  The caller additionally ignores that
+        counter on cancel-only ticks.
+        """
         any_ok = False
         for d in decisions:
             if d.cancel_prior:
                 # Re-price directive: cancel a stale pending favorite; the
                 # next tick places fresh at the updated price.
-                ok, _ = await self.executor.cancel(d.cancel_prior)
-                if ok:
-                    any_ok = True
+                await self.executor.cancel(d.cancel_prior)
                 continue
             token_id = market.up_token_id if d.side == "Up" else market.down_token_id
             ok = await self._place_order(

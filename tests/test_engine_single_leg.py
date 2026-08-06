@@ -1,9 +1,10 @@
 """V4 single-leg order placement via TradingEngine._place_decisions."""
 
 import asyncio
+import time
 
 from poly_trader.platforms.config import Config
-from poly_trader.platforms.engine import TradingEngine
+from poly_trader.platforms.engine import PriceCache, TradingEngine
 from poly_trader.platforms.models import (
     Decision, MarketInfo, PendingOrder, WindowState,
 )
@@ -106,7 +107,12 @@ def test_place_decisions_all_failed():
 
 
 def test_place_decisions_routes_cancel_prior_to_cancel():
-    """A re-price Decision cancels the stale pending order instead of placing."""
+    """A re-price Decision cancels the stale pending order instead of placing.
+
+    The return value feeds the consecutive-placement-failure idle-shutdown
+    counter, so a cancel — success or failure — must NOT count as a placed
+    order: a cancelled favorite says nothing about the account balance.
+    """
     engine = make_engine()
     market = engine._markets["btc-updown-15m-1700000000"]
     ws = WindowState(slug=market.slug, window_num=1)
@@ -122,7 +128,7 @@ def test_place_decisions_routes_cancel_prior_to_cancel():
     d = Decision(side="Cancel", amount=0, price=0.0, cancel_prior="stale_oid")
     ok = asyncio.run(engine._place_decisions(market, ws, [d]))
 
-    assert ok is True
+    assert ok is False  # no order placed — cancels don't count
     assert cancelled == ["stale_oid"]
     assert placed == []
 
@@ -280,3 +286,148 @@ def test_position_poll_absorbs_missed_fill_into_pending():
     assert po.remaining == 0          # phantom pending cleared
     assert ws.cost["Up"] == 5 * 0.50  # missed fill recorded at limit price
     assert ws.trades == 1
+
+
+# ── In-flight order reconciliation (_reconcile_orders) ──
+
+
+def clob_order(oid, token_id, price, size, filled=0, created_at=None):
+    """A raw SDK open-order object as returned by list_open_orders."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        id=oid, token_id=token_id, price=price,
+        original_size=size, size_matched=filled,
+        created_at=created_at or time.time(),
+    )
+
+
+def make_reconcile_engine():
+    engine = make_engine()
+    market = engine._markets["btc-updown-15m-1700000000"]
+    ws = WindowState(slug=market.slug, window_num=1)
+    engine._windows[market.slug] = ws
+    engine._ghost_polls.clear()
+    return engine, market, ws
+
+
+def set_clob(engine, orders):
+    async def fake(condition_id):
+        return orders
+    engine.sdk.get_open_orders_for_market = fake
+
+
+def test_reconcile_closes_ghost_after_consecutive_misses():
+    """An order gone from CLOB for two consecutive polls is a ghost — cancelled
+    out from under us.  Closing it (cancelled_at) unblocks the anti-stack gate
+    that was stalling favorites for the whole window."""
+    engine, market, ws = make_reconcile_engine()
+    ws.pending_orders["g1"] = PendingOrder(
+        order_id="g1", token_id=market.up_token_id,
+        side="Up", buy_sell="BUY", price=0.55, amount=5)
+    set_clob(engine, [])
+
+    changed = asyncio.run(engine._reconcile_orders(ws, market))
+    assert changed is False
+    assert ws.pending_orders["g1"].cancelled_at == 0  # held for a second look
+
+    changed = asyncio.run(engine._reconcile_orders(ws, market))
+    assert changed is True
+    assert ws.pending_orders["g1"].cancelled_at > 0   # ghost closed
+    assert not any(po.cancelled_at == 0 and po.remaining > 0
+                   for po in ws.pending_orders.values())  # anti-stack unblocked
+
+
+def test_reconcile_keeps_order_still_on_clob():
+    """An order the CLOB still lists is left working, poll after poll."""
+    engine, market, ws = make_reconcile_engine()
+    po = PendingOrder(order_id="live1", token_id=market.up_token_id,
+                      side="Up", buy_sell="BUY", price=0.55, amount=5)
+    ws.pending_orders["live1"] = po
+    set_clob(engine, [clob_order("live1", market.up_token_id, 0.55, 5)])
+
+    for _ in range(3):
+        changed = asyncio.run(engine._reconcile_orders(ws, market))
+        assert changed is False
+
+    assert po.cancelled_at == 0
+    assert "live1" in ws.pending_orders
+
+
+def test_reconcile_purges_filled_phantom_immediately():
+    """A fully-filled order that left CLOB is stale bookkeeping — purge it on
+    the first poll (no confirmation window needed: it can't move anything)."""
+    engine, market, ws = make_reconcile_engine()
+    ws.pending_orders["p1"] = PendingOrder(
+        order_id="p1", token_id=market.up_token_id,
+        side="Up", buy_sell="BUY", price=0.55, amount=5, filled=5)
+    set_clob(engine, [])
+
+    changed = asyncio.run(engine._reconcile_orders(ws, market))
+    assert changed is True
+    assert "p1" not in ws.pending_orders
+
+
+def test_reconcile_skips_already_cancelled():
+    """Our own soft-cancelled orders are owned by flush_cancelled — the
+    reconcile never double-closes or purges them."""
+    engine, market, ws = make_reconcile_engine()
+    po = PendingOrder(order_id="c1", token_id=market.up_token_id,
+                      side="Up", buy_sell="BUY", price=0.55, amount=5)
+    po.cancelled_at = time.time()
+    ws.pending_orders["c1"] = po
+    set_clob(engine, [])
+
+    changed = asyncio.run(engine._reconcile_orders(ws, market))
+    assert changed is False
+    assert "c1" in ws.pending_orders
+    assert po.cancelled_at > 0
+
+
+def test_reconcile_query_failure_is_noop():
+    """An API failure (None) must NOT be read as 'no open orders' — pending
+    stays untouched, ghosts never get closed."""
+    engine, market, ws = make_reconcile_engine()
+    ws.pending_orders["g1"] = PendingOrder(
+        order_id="g1", token_id=market.up_token_id,
+        side="Up", buy_sell="BUY", price=0.55, amount=5)
+
+    async def fail(condition_id):
+        return None
+    engine.sdk.get_open_orders_for_market = fail
+
+    changed = asyncio.run(engine._reconcile_orders(ws, market))
+    assert changed is False
+    assert ws.pending_orders["g1"].cancelled_at == 0
+
+
+# ── PriceCache.wait_update ──
+
+
+def test_wait_update_reacts_promptly_to_update_during_processing():
+    """An update that lands while the previous tick is still processing must
+    wake the next wait_update immediately — not be cleared into a full
+    timeout sleep (the lost-wakeup bug)."""
+    pc = PriceCache()
+
+    async def scenario():
+        await pc.wait_update(timeout=0.05)    # nothing yet → times out
+        pc.update_from_ws("tok", 0.50, 0.51)  # update "during processing"
+        start = time.monotonic()
+        await pc.wait_update(timeout=5.0)     # must not sleep the full 5s
+        return time.monotonic() - start
+
+    elapsed = asyncio.run(scenario())
+    assert elapsed < 1.0, f"wait_update slept {elapsed:.2f}s despite fresh data"
+
+
+def test_wait_update_sleeps_timeout_with_no_new_update():
+    """No new update → wait_update sleeps the timeout (idle keep-alive)."""
+    pc = PriceCache()
+
+    async def scenario():
+        start = time.monotonic()
+        await pc.wait_update(timeout=0.1)
+        return time.monotonic() - start
+
+    elapsed = asyncio.run(scenario())
+    assert elapsed >= 0.05, f"wait_update returned early: {elapsed:.3f}s"

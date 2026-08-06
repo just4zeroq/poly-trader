@@ -2,24 +2,30 @@
 V4 simplified predictive strategy — favorite → hedge → flat.
 
 Each tick the window state machine runs:
-  1. elapsed < pred_start_elapsed (60s)              → []          (no orders at all — window not established)
-  2. bound hedge ready (favorite filled ≥ 4)         → hedge at ≤ bound; a position that outgrew min_order_size + 1
-                                                       drops the plan and goes generic (blended-cost guard)
-  3. auth_inv[Up] != auth_inv[Down]                  → hedge the light side; single-unit imbalance (≤ min_order_size
-                                                       + 1) uses a bound-style hedge anchored to the heavy avg cost,
-                                                       larger goes generic (blended-cost guard)
-  4. remaining_time < min_remaining_time (180s)      → []          (last 3 min: no NEW favorite; hedges above keep running)
-  5. auth_inv flat + active pending                  → []          (anti-stack)
-  6. auth_inv flat + confident favorite              → buy favorite
+  1. elapsed < pred_start_elapsed (60s)               → []          (no orders at all — window not established)
+  2. any pending order (filled < min_order_size − 1)  → []          (anti-stack; stale priced-out favorites cancelled)
+  3. bound hedge owns its fully-filled favorite       → hedge at ≤ bound; a position that outgrew min_order_size + 1
+                                                          drops the plan and goes generic (blended-cost guard); a
+                                                          sub-min residual (partial fill) folds into the next favorite
+  4. auth_inv imbalanced                              → hedge the light side; single-unit imbalance (≤ min_order_size
+                                                          + 1) uses a bound-style hedge anchored to the heavy avg cost,
+                                                          larger goes generic (blended-cost guard)
+  5. remaining_time < min_remaining_time (180s)       → []          (last 3 min: no NEW favorite; hedges above keep running)
+  6. auth_inv flat + confident favorite               → buy favorite
 
 The favorite (step 6) is offered at the book's maker price — the model's
 P_fair only picks the direction, never intervenes on price.  Once the order
 is successfully placed, the executor records a bound hedge plan (opposite
 side, full order size, max hedge price = hedge_price_bound − favorite_price)
 — never at decision time, so a plan always corresponds to a real live order.
-Once that order has filled ≥ 4 (round, not truncate — a 4.992 fill counts),
-step 2 fires the hedge at the light side's maker price, but never above the
-bound.
+
+The pending gate (step 2) is the anti-stack: an order whose fill has NOT
+reached min_order_size − 1 blocks ALL new orders (favorite, bound hedge,
+generic hedge).  So a favorite must fully fill before it is hedged — a
+partial fill (e.g. 4/5) no longer blocks (it is not "pending"), and its
+sub-min residual folds into the next favorite round, which then gets locked
+in one ≥ min_order_size hedge.  A favorite that sits pending too long and
+gets priced out is cancelled proactively so the window isn't idle.
 
 The strategy gates ONLY on ws.auth_inv (authoritative positions): WS fills
 write it through optimistically and the engine's 2s position poll overwrites
@@ -35,10 +41,6 @@ from .models import Decision, HedgePlan, WindowState, _parse_duration_from_slug
 from .predictor import Predictor
 
 logger = logging.getLogger(__name__)
-
-# The favorite must be substantially filled before its bound hedge fires.
-# A 5-contract maker fill reports as 4.992 (fee artifact) — that counts.
-MIN_FAVORITE_FILL = 4.0
 
 
 class V4Strategy:
@@ -67,91 +69,93 @@ class V4Strategy:
         if elapsed < cfg.pred_start_elapsed:
             return []
 
-        # Bound hedge: owns the favorite it is tied to.  A favorite that has
-        # filled ≥ 4 must be locked against its pre-determined max price;
-        # until then the generic imbalance hedge must NOT touch its partial
-        # fill (hedging happens only once the favorite is substantially in).
-        # Runs regardless of min_remaining_time — the hedge leg monitors and
-        # places until the very end of the window.
+        # Pending gate — the anti-stack.  An order whose fill has NOT reached
+        # min_order_size − 1 blocks ALL new orders (favorite, bound hedge,
+        # generic hedge): a partially-filled favorite is still owned, and a
+        # resting hedge is still locking its position.  Only stale, priced-out
+        # lead-leg favorites may be cancelled (re-priced against the fresh
+        # book).  Runs regardless of min_remaining_time — hedges monitor and
+        # place until the very end of the window.
+        if self._has_active_pending(ws):
+            return self._reprice_stale_favorites(ws, up_price, down_price)
+
+        # No pending → every tracked order has filled ≥ min_order_size − 1 or
+        # is cancelled.  A live bound plan owns its (now substantially-filled)
+        # favorite: a single favorite's worth of imbalance (∈ [min_order_size,
+        # min_order_size + 1]) is locked against the placement-time price
+        # bound; anything larger (residuals folded in) spans mixed costs →
+        # drop the plan and let the generic blended-cost guard own the lock.
+        # A sub-min residual (partial favorite fill) is not a hedgeable unit →
+        # drop the plan; the residual folds into the next favorite round.
         plan = ws.hedge_plan
         plan_live = plan is not None and not plan.placed
         if plan_live:
-            # Sync the running fill from the live pending order (covers fills
-            # the CLOB poll attributed to it that never hit _process_fill).
-            po = ws.pending_orders.get(plan.order_id)
-            if po is not None:
-                plan.filled = po.filled
-            if plan.filled >= MIN_FAVORITE_FILL:
-                # Route by imbalance size.  A single favorite (≤ min_order_size
-                # + 1) is locked by the plan's placement-time price bound; a
-                # position that has outgrown it (residual folded in) spans
-                # mixed costs, so drop the plan and let the generic
-                # blended-cost guard own the lock.
-                heavy = "Down" if plan.side == "Up" else "Up"
-                amount = ws.auth_inv[heavy] - ws.auth_inv[plan.side]
-                if amount > cfg.min_order_size + 1:
-                    logger.info(
-                        "  [hedge] accumulated %d > %d → generic, drop plan %s",
-                        amount, cfg.min_order_size + 1,
-                        plan.order_id[:10] if plan.order_id else "?")
-                    ws.hedge_plan = None
-                    price = down_price if plan.side == "Down" else up_price
-                    return self._place_hedge(ws, plan.side, price, amount)
-                return self._place_bound_hedge(ws, plan, up_price, down_price)
-            # Not filled enough yet.  If its order is no longer live (cancelled
-            # by a reprice, or dropped), abandon the plan so the window isn't
-            # blocked by a dead favorite.
-            if po is None or po.cancelled_at != 0:
+            heavy = "Down" if plan.side == "Up" else "Up"
+            amount = ws.auth_inv[heavy] - ws.auth_inv[plan.side]
+            if amount > cfg.min_order_size + 1:
+                logger.info(
+                    "  [hedge] accumulated %d > %d → generic, drop plan %s",
+                    amount, cfg.min_order_size + 1,
+                    plan.order_id[:10] if plan.order_id else "?")
                 ws.hedge_plan = None
-                plan_live = False
+                price = down_price if plan.side == "Down" else up_price
+                return self._place_hedge(ws, plan.side, price, amount)
+            if amount >= cfg.min_order_size:
+                return self._place_bound_hedge(ws, plan, up_price, down_price)
+            # amount < min_order_size — the favorite only partially filled and
+            # its sub-min residual folds into the next favorite round.
+            ws.hedge_plan = None
 
-        # Generic imbalance hedge — no bound plan owns the position.  Route by
-        # imbalance size: a single-unit imbalance (≤ min_order_size + 1) is one
-        # favorite's worth and is locked with bound-style price discipline
-        # anchored to the heavy side's average cost; anything larger spans mixed
-        # costs and uses the blended-cost guard.  Also runs regardless of
-        # min_remaining_time (hedge leg never quits).  |imbalance| <
-        # min_order_size is below the strategy's unit: no sub-min hedge order.
-        # Fall through so the residual folds into the next favorite round,
-        # which gets locked in one ≥ min_order_size hedge.
-        if not plan_live:
-            diff = ws.auth_inv["Up"] - ws.auth_inv["Down"]
-            if diff >= cfg.min_order_size:
-                side, amount = "Down", diff
-            elif diff <= -cfg.min_order_size:
-                side, amount = "Up", -diff
-            else:
-                side, amount = None, 0
-            if side is not None:
-                if amount <= cfg.min_order_size + 1:
-                    return self._place_synthetic_bound_hedge(
-                        ws, side, up_price, down_price)
-                return self._place_hedge(
-                    ws, side, down_price if side == "Down" else up_price, amount)
+        # Generic imbalance hedge — no bound plan owns the position (a dropped
+        # plan means nothing is left to protect).  Route by imbalance size: a
+        # single-unit imbalance (≤ min_order_size + 1) is one favorite's worth
+        # and is locked with bound-style price discipline anchored to the heavy
+        # side's average cost; anything larger spans mixed costs and uses the
+        # blended-cost guard.  Also runs regardless of min_remaining_time
+        # (hedge leg never quits).  |imbalance| < min_order_size is below the
+        # strategy's unit: no sub-min hedge order.  Fall through so the
+        # residual folds into the next favorite round, which gets locked in
+        # one ≥ min_order_size hedge.
+        diff = ws.auth_inv["Up"] - ws.auth_inv["Down"]
+        if diff >= cfg.min_order_size:
+            side, amount = "Down", diff
+        elif diff <= -cfg.min_order_size:
+            side, amount = "Up", -diff
+        else:
+            side, amount = None, 0
+        if side is not None:
+            if amount <= cfg.min_order_size + 1:
+                return self._place_synthetic_bound_hedge(
+                    ws, side, up_price, down_price)
+            return self._place_hedge(
+                ws, side, down_price if side == "Down" else up_price, amount)
 
         # Last 3 minutes: no NEW favorite — it wouldn't fill in time to be
         # hedged at an affordable price.  (Hedges above already took priority.)
         if remaining_time < cfg.min_remaining_time:
             return []
 
-        # Flat — wait for any open order to fill/cancel before re-entering.
-        # A favorite that sits unfilled too long would block the whole window
-        # here, so re-price it instead of waiting silently.
-        if self._has_active_pending(ws):
-            return self._reprice_stale_favorites(
-                ws, up_price, down_price, elapsed, remaining_time)
-
+        # Flat + no pending + no live plan → place the fresh favorite (model
+        # direction, maker price, min_order_size contracts).
         return self._place_favorite(ws, up_price, down_price, elapsed, remaining_time)
 
     # ──────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────
 
-    @staticmethod
-    def _has_active_pending(ws: WindowState) -> bool:
-        """True if any live (uncancelled, not-fully-filled) pending order exists."""
-        return any(po.cancelled_at == 0 and po.remaining > 0
-                   for po in ws.pending_orders.values())
+    def _has_active_pending(self, ws: WindowState) -> bool:
+        """True if any live (uncancelled) pending order with filled < min − 1 exists.
+
+        "Pending" = an order whose fill has NOT reached min_order_size − 1.
+        Such an order still owns its position and blocks all new orders
+        (anti-stack).  An order filled ≥ min_order_size − 1 no longer blocks:
+        it is routed instead (hedge if it cleared min_order_size, else its
+        sub-min residual folds into the next favorite round).
+        """
+        return any(
+            po.cancelled_at == 0 and po.filled < self.cfg.min_order_size - 1
+            for po in ws.pending_orders.values()
+        )
 
     def _place_hedge(
         self, ws: WindowState, side: str, price: float, amount: int,
@@ -207,9 +211,13 @@ class V4Strategy:
         self, ws: WindowState, plan: HedgePlan,
         up_price: float, down_price: float,
     ) -> list[Decision]:
-        """Fire the bound hedge once the favorite it is tied to has filled ≥ 4.
+        """Fire the bound hedge once its favorite no longer blocks the window.
 
-        The hedge side and max price were decided when the favorite was placed.
+        Called only when no pending order blocks (every tracked order has
+        filled ≥ min_order_size − 1 or is cancelled) and the favorite's live
+        imbalance is a single favorite's worth (∈ [min_order_size,
+        min_order_size + 1]).  The hedge side and max price were decided when
+        the favorite was placed.
         The AMOUNT is the current live imbalance: a sub-min residual folded
         into the next favorite accumulates on the heavy side, and only the
         live imbalance fully locks it (for a plain favorite this equals the
@@ -370,53 +378,57 @@ class V4Strategy:
     def _reprice_stale_favorites(
         self, ws: WindowState,
         up_price: float, down_price: float,
-        elapsed: float, remaining_time: float,
     ) -> list[Decision]:
-        """Cancel stale unfilled favorites so the next tick re-evaluates.
+        """Proactively cancel long-unfilled, priced-out favorites.
 
-        With the anti-stack gate, a favorite that never fills blocks every
-        later tick of the window (one shot per window).  When the model's
-        fresh placement would now be materially better — a higher re-bid, a
-        flipped favorite side, or the model going quiet — cancel the resting
-        order and let the next tick place fresh at the updated price.
+        A favorite that never fills blocks every later tick of the window under
+        the pending gate (filled < min_order_size − 1 → all new orders
+        blocked).  It is cancelled only when BOTH hold:
 
-        Never re-price a pending order on the light side: favorites always
-        rest on the heavy side, so the light side's only pending order can be
-        the hedge locking the live imbalance.  Cancelling it would throw away
-        a committed bound hedge (plan already consumed, no retry) and leave
-        the filled contracts naked.
+          - it has rested favorite_stale_seconds without filling, AND
+          - the current maker price has moved MORE than stale_price_diff ABOVE
+            its limit — a bid the market has run past will not fill.  A bid the
+            market still sits at (or has fallen below) can still fill, so
+            cancelling it would be pure churn (cancel → re-place at nearly the
+            same price).
+
+        The next tick then places fresh at the current book maker price.
+
+        Only the lead leg (先行脚 / favorite) is ever cancelled.  The hedge leg
+        (对冲脚) is never touched: cancelling it would throw away a committed
+        bound hedge and leave the filled contracts naked.  A pending order is a
+        hedge when it sits on the light side (fewer auth_inv contracts), or
+        when a consumed plan (placed=True) recorded it as the hedge side — the
+        latter also covers the flat case where the hedge is still resting while
+        auth_inv reads equal.
         """
         cfg = self.cfg
         now = time.time()
-        fresh = self._favorite_decision(
-            ws, up_price, down_price, remaining_time, log=False)
-        # A working hedge owns the light side.  Flat (no imbalance) → neither
-        # side is light, so nothing is protected and all stale favorites can
-        # still be re-priced.
+
+        # 对冲脚: the light side of the live imbalance, or the side of a
+        # consumed bound-hedge plan (the hedge leg already fired).
         diff = ws.auth_inv["Up"] - ws.auth_inv["Down"]
-        light_side = "Down" if diff > 0 else ("Up" if diff < 0 else None)
+        hedge_sides = {"Down"} if diff > 0 else ({"Up"} if diff < 0 else set())
+        plan = ws.hedge_plan
+        if plan is not None and plan.placed:
+            hedge_sides.add(plan.side)
+
         cancels: list[Decision] = []
         for po in ws.pending_orders.values():
-            if po.side == light_side:
-                continue  # a working hedge — never re-price it
+            if po.side in hedge_sides:
+                continue  # 对冲脚 — never cancel a working hedge
             if po.cancelled_at != 0 or po.remaining <= 0:
                 continue
+            if po.filled >= cfg.min_order_size - 1:
+                continue  # filled enough to route — not a blocking pending
             age = now - po.placed_at
             if age < cfg.favorite_stale_seconds:
                 continue  # still a reasonable shot — leave it working
-            if fresh is None:
-                # Nothing better to place (model quiet / pair-cost or exposure
-                # guard) — keep the resting order working; if the model
-                # re-confirms later, the flip/price checks below catch it.
-                continue
-            if fresh.side != po.side:
-                reason = f"model flipped to {fresh.side}"
-            elif fresh.price - po.price > 0.005:
-                reason = f"re-bid {po.price:.4f}→{fresh.price:.4f}"
-            else:
-                continue  # fresh placement no better than the resting order
-            logger.info("  [reprice] %s stale (age=%.0fs, %s) → cancel %s…",
-                        po.side, age, reason, po.order_id[:8])
+            cur = up_price if po.side == "Up" else down_price
+            if cur <= po.price + cfg.stale_price_diff:
+                continue  # not priced out — cancelling would just churn
+            logger.info("  [reprice] %s stale (age=%.0fs, %.4f → %.4f) → cancel %s…",
+                        po.side, age, po.price, cur, po.order_id[:8])
             cancels.append(Decision(
                 side="Cancel", amount=0, price=0.0,
                 cancel_prior=po.order_id))

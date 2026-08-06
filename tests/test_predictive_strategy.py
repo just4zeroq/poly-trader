@@ -319,11 +319,13 @@ def test_synthetic_bound_waits_when_light_above_bound():
 
 
 def test_pending_favorite_blocks_new_favorite():
+    """A fresh (younger than stale threshold) pending favorite blocks a new
+    favorite — anti-stack.  Only stale ones get cancelled proactively."""
     strat, cfg = make_strategy(btc_price=100.3)
     ws = make_ws(cfg)
     ws.pending_orders["ord_up_1"] = PendingOrder(
         order_id="ord_up_1", token_id="t_up", side="Up",
-        buy_sell="BUY", price=0.55, amount=5)
+        buy_sell="BUY", price=0.55, amount=5, placed_at=time.time())
     assert strat.decide(ws, up_price=0.55, down_price=0.45,
                         remaining_time=800.0) == []
 
@@ -340,6 +342,44 @@ def test_cancelled_pending_does_not_block():
     assert decisions[0].side == "Up"
 
 
+def test_order_filled_min_minus_1_does_not_block():
+    """Pending boundary: an order filled min_order_size − 1 (4/5) is NOT
+    'pending' (filled < min − 1 is the gate) — it no longer blocks new orders.
+    A 4-contract sub-min residual folds into the next favorite round."""
+    strat, cfg = make_strategy(btc_price=100.3)  # confident Up
+    ws = make_ws(cfg, auth_inv={"Up": 4, "Down": 0})  # 4/5 favorite residual
+    ws.pending_orders["ord_up_1"] = PendingOrder(
+        order_id="ord_up_1", token_id="t_up", side="Up",
+        buy_sell="BUY", price=0.55, amount=5, filled=4,
+        placed_at=time.time())
+    decisions = strat.decide(ws, up_price=0.55, down_price=0.45,
+                             remaining_time=800.0)
+    assert len(decisions) == 1
+    assert decisions[0].side == "Up"          # new favorite, not a hedge
+    assert decisions[0].amount == cfg.min_order_size
+    assert decisions[0].creates_hedge_plan is True
+
+
+def test_partial_fill_at_min_minus_1_folds_into_next_favorite():
+    """A live bound plan whose favorite filled only min_order_size − 1 (4/5) is
+    NOT a hedgeable unit (diff < min_order_size) — 满单才补腿.  The plan is
+    dropped and the residual folds into the next favorite round, which gets
+    locked in one ≥ min_order_size hedge later."""
+    strat, cfg = make_strategy(btc_price=100.3)  # confident Up
+    ws = make_ws(cfg, auth_inv={"Up": 4, "Down": 0})
+    ws.hedge_plan = _plan(filled=4.0)  # favorite Up filled 4/5, plan live
+    ws.pending_orders["ord_up_1"] = PendingOrder(
+        order_id="ord_up_1", token_id="t_up", side="Up",
+        buy_sell="BUY", price=0.55, amount=5, filled=4,
+        placed_at=time.time())
+    decisions = strat.decide(ws, up_price=0.55, down_price=0.45,
+                             remaining_time=800.0)
+    assert len(decisions) == 1
+    assert decisions[0].side == "Up"          # new favorite, not a hedge
+    assert decisions[0].amount == cfg.min_order_size
+    assert ws.hedge_plan is None              # plan dropped — residual folds
+
+
 # ── Step 4b: stale favorite re-pricing ──
 
 
@@ -351,83 +391,102 @@ def _pending(side, price, age, oid="ord_1"):
 
 
 def test_stale_favorite_not_repriced_before_threshold():
-    """A favorite younger than favorite_stale_seconds is left working."""
+    """A favorite younger than favorite_stale_seconds is left working, even if
+    it is already priced out."""
     strat, cfg = make_strategy(btc_price=100.3)  # Up favorite
     ws = make_ws(cfg)
     ws.pending_orders["ord_up_1"] = _pending("Up", 0.54, age=10)
-    assert strat.decide(ws, up_price=0.54, down_price=0.45,
+    assert strat.decide(ws, up_price=0.70, down_price=0.45,
                         remaining_time=800.0) == []
 
 
-def test_stale_favorite_not_repriced_when_price_same():
-    """Old but still at the fresh placement price → no pointless cancel/churn."""
+def test_stale_favorite_repriced_when_priced_out():
+    """age > favorite_stale_seconds AND the current maker moved more than
+    stale_price_diff ABOVE the limit → the bid will not fill → cancel; the next
+    tick re-places at the fresh book price."""
     strat, cfg = make_strategy(btc_price=100.3)
     ws = make_ws(cfg)
-    ws.pending_orders["ord_up_1"] = _pending("Up", 0.54, age=40)
+    ws.pending_orders["ord_up_1"] = _pending("Up", 0.54, age=200, oid="ord_up_1")
+    decisions = strat.decide(ws, up_price=0.65, down_price=0.45,
+                             remaining_time=800.0)  # 0.65 > 0.54 + 0.10
+    assert len(decisions) == 1
+    assert decisions[0].side == "Cancel"
+    assert decisions[0].cancel_prior == "ord_up_1"
+
+
+def test_stale_favorite_not_repriced_when_not_priced_out():
+    """age > favorite_stale_seconds but the current maker is still within
+    stale_price_diff of the limit → NOT cancelled (churn guard: cancel →
+    re-place at nearly the same price buys nothing)."""
+    strat, cfg = make_strategy(btc_price=100.3)
+    ws = make_ws(cfg)
+    ws.pending_orders["ord_up_1"] = _pending("Up", 0.54, age=200, oid="ord_up_1")
     assert strat.decide(ws, up_price=0.54, down_price=0.45,
                         remaining_time=800.0) == []
 
 
-def test_stale_favorite_repriced_when_model_flips():
-    """Model flipped away from the resting favorite → cancel it."""
+def test_stale_favorite_not_repriced_when_price_moved_below():
+    """Current maker BELOW the limit → our bid is now the competitive side of
+    the book (likely to fill) → never cancel it.  Only a market that ran ABOVE
+    our bid (priced out) triggers the reprice."""
+    strat, cfg = make_strategy(btc_price=100.3)
+    ws = make_ws(cfg)
+    ws.pending_orders["ord_up_1"] = _pending("Up", 0.54, age=200, oid="ord_up_1")
+    assert strat.decide(ws, up_price=0.40, down_price=0.45,
+                        remaining_time=800.0) == []
+
+
+def test_stale_favorite_repriced_on_heavy_side():
+    """A stale, priced-out pending on the heavy side (a favorite) is cancelled
+    regardless of which side the model favors."""
     strat, cfg = make_strategy(btc_price=100.3)  # model favors Up
     ws = make_ws(cfg)
-    ws.pending_orders["ord_down_1"] = _pending("Down", 0.43, age=40, oid="ord_down_1")
-    decisions = strat.decide(ws, up_price=0.54, down_price=0.43,
-                             remaining_time=800.0)
+    ws.pending_orders["ord_down_1"] = _pending("Down", 0.43, age=200, oid="ord_down_1")
+    decisions = strat.decide(ws, up_price=0.54, down_price=0.60,
+                             remaining_time=800.0)  # 0.60 > 0.43 + 0.10
     assert len(decisions) == 1
     assert decisions[0].side == "Cancel"
     assert decisions[0].cancel_prior == "ord_down_1"
 
 
-def test_stale_favorite_repriced_when_rebid_higher():
-    """Model fair moved up → re-bid at the higher price instead of holding the dead low-ball."""
-    strat, cfg = make_strategy(btc_price=100.3)
-    ws = make_ws(cfg)
-    ws.pending_orders["ord_up_1"] = _pending("Up", 0.50, age=40, oid="ord_up_1")
-    decisions = strat.decide(ws, up_price=0.60, down_price=0.30,
-                             remaining_time=800.0)
-    assert len(decisions) == 1
-    assert decisions[0].side == "Cancel"
-    assert decisions[0].cancel_prior == "ord_up_1"
-
-
-def test_stale_favorite_kept_when_model_quiet():
-    """Model quiet (or a guard blocking a fresh placement) → nothing better to
-    place, so leave the resting favorite working rather than churn-cancelling."""
-    strat, cfg = make_strategy(btc_price=100.0)  # P_fair ≈ 0.48 → not confident
-    ws = make_ws(cfg)
-    ws.pending_orders["ord_up_1"] = _pending("Up", 0.55, age=40, oid="ord_up_1")
-    assert strat.decide(ws, up_price=0.55, down_price=0.45,
-                        remaining_time=800.0) == []
-
-
 def test_reprice_skips_stale_hedge_on_light_side():
-    """A stale hedge on the light side (locking a sub-min imbalance) is never
-    re-priced — cancelling it would throw away a committed bound hedge (plan
-    already consumed) and leave the filled favorite naked.  Only the stale
-    favorite itself gets the re-bid cancel."""
-    strat, cfg = make_strategy(btc_price=100.3)  # confident Up
+    """A stale pending hedge on the light side (locking a sub-min imbalance) is
+    never cancelled — only the stale favorite (先行脚) is.  Cancelling the hedge
+    would throw away a committed bound hedge (plan already consumed) and leave
+    the filled contracts naked."""
+    strat, cfg = make_strategy(btc_price=100.3)
     # Sub-min imbalance (diff 4 < min_order_size 5): favorite Up filled 4,
     # bound hedge Down resting to lock it.  Plan already consumed.
     ws = make_ws(cfg, auth_inv={"Up": 4, "Down": 0})
     ws.hedge_plan = _plan(side="Down", fav_price=0.54, filled=5.0, placed=True)
-    # Stale favorite: re-bid 0.50 → 0.60 is materially better → should cancel.
-    ws.pending_orders["ord_up_1"] = PendingOrder(
-        order_id="ord_up_1", token_id="t_up", side="Up",
-        buy_sell="BUY", price=0.50, amount=5, filled=4,
-        placed_at=time.time() - 40)
-    # Stale hedge on the light side — must NOT be cancelled.
+    # Stale, priced-out favorite on the heavy side — should cancel.
+    ws.pending_orders["ord_up_1"] = _pending("Up", 0.50, age=200, oid="ord_up_1")
+    # Stale, priced-out hedge on the light side — must NOT be cancelled.
     ws.pending_orders["ord_down_hedge"] = PendingOrder(
         order_id="ord_down_hedge", token_id="t_down", side="Down",
         buy_sell="BUY", price=0.44, amount=4, filled=0,
-        placed_at=time.time() - 40)
-    decisions = strat.decide(ws, up_price=0.60, down_price=0.44,
+        placed_at=time.time() - 200)
+    decisions = strat.decide(ws, up_price=0.65, down_price=0.60,
                              remaining_time=800.0)
     assert len(decisions) == 1
     assert decisions[0].side == "Cancel"
     assert decisions[0].cancel_prior == "ord_up_1"
     assert decisions[0].cancel_prior != "ord_down_hedge"
+
+
+def test_reprice_skips_stale_hedge_on_flat_consumed_plan():
+    """Flat auth_inv + a consumed plan: a stale pending on the plan's hedge
+    side is still protected (对冲脚), even with no live imbalance to point at
+    the light side — age and price-out are irrelevant for the hedge leg."""
+    strat, cfg = make_strategy(btc_price=100.3)
+    ws = make_ws(cfg)  # flat auth_inv
+    ws.hedge_plan = _plan(side="Down", fav_price=0.54, filled=5.0, placed=True)
+    ws.pending_orders["ord_down_hedge"] = PendingOrder(
+        order_id="ord_down_hedge", token_id="t_down", side="Down",
+        buy_sell="BUY", price=0.44, amount=4, filled=0,
+        placed_at=time.time() - 200)
+    assert strat.decide(ws, up_price=0.60, down_price=0.60,
+                        remaining_time=800.0) == []
 
 
 # ── Step 5: flat + confident favorite → buy ──
@@ -549,14 +608,16 @@ def test_favorite_tags_creates_hedge_plan_but_defers_record():
     assert ws.hedge_plan is None  # record deferred to executor.place success
 
 
-def test_hedge_waits_until_favorite_fills_4():
-    """A plan whose favorite has filled < 4 does not hedge — and the generic
-    imbalance hedge must not touch the partial fill either."""
+def test_hedge_waits_while_favorite_pending():
+    """A partially-filled favorite (3/5) is 'pending' (filled < min_order_size
+    − 1) → it blocks ALL orders (favorite, bound hedge, generic hedge) until
+    it fills to min_order_size − 1 or is cancelled.  The generic imbalance
+    hedge must NOT touch its partial fill."""
     strat, cfg = make_strategy(btc_price=100.3)
     ws = make_ws(cfg, auth_inv={"Up": 3, "Down": 0})  # partial 3/5 favorite
     ws.hedge_plan = _plan(filled=3.0)
-    # The favorite order is live (fresh, partially filled 3/5) — keeps the
-    # plan alive so neither the bound hedge nor the generic hedge fires.
+    # The favorite order is live (fresh, partially filled 3/5) — pending gate
+    # blocks both the bound hedge and the generic hedge.
     ws.pending_orders["ord_up_1"] = PendingOrder(
         order_id="ord_up_1", token_id="t_up", side="Up",
         buy_sell="BUY", price=0.55, amount=5, filled=3,
@@ -580,11 +641,13 @@ def test_bound_hedge_placed_when_filled():
     assert ws.hedge_plan.placed is True  # consumed exactly once
 
 
-def test_4p992_fill_triggers_hedge():
-    """A 4.992 fill counts as ≥ 4 — the fee-artifact truncation case."""
+def test_bound_hedge_fires_on_fully_filled_favorite():
+    """A fully-filled favorite (live imbalance = min_order_size) fires the
+    bound hedge.  plan.filled is now informational only — the pending gate +
+    live imbalance route the hedge, not a plan.filled threshold."""
     strat, cfg = make_strategy(btc_price=100.3)
     ws = make_ws(cfg, auth_inv={"Up": 5, "Down": 0})
-    ws.hedge_plan = _plan(filled=4.992)
+    ws.hedge_plan = _plan(filled=0.0)  # informational — no longer the trigger
     decisions = strat.decide(ws, up_price=0.55, down_price=0.45,
                              remaining_time=800.0)
     assert len(decisions) == 1

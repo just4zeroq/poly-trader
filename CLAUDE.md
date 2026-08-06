@@ -54,7 +54,7 @@ python -m poly_trader check                               # verify credentials
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `POLY_MAX_PER_SIDE` | 20 | Max filled exposure per side; caps hedge size and favorite guard |
+| `POLY_MAX_PER_SIDE` | 20 (fallback) | Max filled exposure per side; caps hedge size and favorite guard. Set in `.env` (live: 100) |
 | `POLY_AGGRESSIVENESS` | 0.3 | Maker price = bid + spread × aggressiveness (0-1) |
 | `POLY_PAIR_COST_TARGET_EXTREME` | 0.99 | Hedge cost guard: skip when heavy avg cost + hedge price > this |
 | `POLY_MIN_ORDER_SIZE` | 5 | Favorite order size (contracts) |
@@ -64,7 +64,8 @@ python -m poly_trader check                               # verify credentials
 | `POLY_PRED_CONF_THRESHOLD` | 0.05 | Min \|P_fair − 0.5\| to place a favorite |
 | `POLY_PRED_START_ELAPSED` | 60.0 | Seconds into window before first favorite order |
 | `POLY_PRED_BTC_MAX_AGE` | 8.0 | Skip predictive decisions when cached BTC price older than this |
-| `POLY_FAVORITE_STALE_SECONDS` | 25.0 | Cancel + re-price an unfilled favorite this many seconds old, when the fresh placement is materially better (flipped side / re-bid > +0.005) — prevents an unfilled bid from blocking the whole window |
+| `POLY_FAVORITE_STALE_SECONDS` | 120.0 | A pending favorite (`filled < min_order_size − 1`) resting this many seconds AND priced out by > `stale_price_diff` is cancelled (lead leg only — never the hedge leg) so the next tick re-places at the current book price — prevents an unfilled bid from blocking the whole window |
+| `POLY_STALE_PRICE_DIFF` | 0.10 | Churn guard for stale-cancel: cancel only when the current maker has moved > this ABOVE the resting limit (a bid the market ran past won't fill). A bid still at/near its limit can still fill — cancelling it would just churn |
 | `POLY_HEDGE_PRICE_BOUND` | 0.998 | Bound-hedge price ceiling decided at favorite placement: `max_price = hedge_price_bound − fav_price` |
 | `POLY_POSITIONS_INTERVAL` | 2.0 | CLOB position poll interval (0 disables) — refreshes `auth_inv` |
 | `POLY_MIN_TICK_INTERVAL` | 0.0 | Min seconds between ticks (0 = no throttle, so the bound hedge fires as soon as its favorite fills ≥ 4) |

@@ -171,17 +171,18 @@ class HedgePlan:
     (executor.place — never at decision time), so it always corresponds to a
     real live order.  At that point we know: which side to hedge (the opposite
     leg), the max hedge price (hedge_price_bound − favorite price), and the
-    amount (the full favorite order size).  The hedge is only fired once that
-    favorite order has filled ≥ 4 (round, not truncate — a 4.992 fill counts).
-    ``placed`` is set True the moment the hedge Decision is emitted so the
-    plan is consumed exactly once.
+    amount (the full favorite order size).  The hedge fires once the favorite's
+    fill has reached min_order_size − 1 (so it no longer blocks the pending
+    gate) and its live imbalance is a single favorite's worth (∈ [min_order_size,
+    min_order_size + 1]).  ``placed`` is set True the moment the hedge Decision
+    is emitted so the plan is consumed exactly once.
     """
     order_id: str        # the favorite order to hedge against
     side: str            # opposite side to buy ("Up" / "Down")
     amount: int          # full favorite order size
     fav_price: float     # favorite order limit price
     max_price: float     # hedge_price_bound − fav_price
-    filled: float = 0.0  # running fill of the favorite order (float, ≥ 4 fires)
+    filled: float = 0.0  # running fill of the favorite order (informational only)
     placed: bool = False  # True once the hedge Decision is emitted
 
 
